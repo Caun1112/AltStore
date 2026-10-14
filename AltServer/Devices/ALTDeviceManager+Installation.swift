@@ -452,7 +452,7 @@ extension ALTDeviceManager
                     self.encryptedPairingData(for: application, device: registeredDevice, certificate: certificate) { continuation.resume(returning: $0) }
                 }
                 _ = try await managedApplicationResult { (callback: @escaping (Result<Void, Error>) -> Void) in
-                    self.install(application, to: registeredDevice, team: team, certificate: certificate, profiles: profiles, pairingFile: pairingFile, completionHandler: callback)
+                    self.install(application, to: registeredDevice, team: team, certificate: certificate, profiles: profiles, pairingFile: pairingFile, preservingOtherAppProfiles: true, completionHandler: callback)
                 }
                 let updatedSnapshot = try await self.managedApplicationSnapshot(on: device)
                 guard let updatedDictionary = updatedSnapshot.application(identifier), let updatedProfile = updatedSnapshot.profile(identifier),
@@ -461,6 +461,15 @@ extension ALTDeviceManager
                       (updatedDictionary["CFBundleShortVersionString"] as? String) == originalIPA.version,
                       (updatedDictionary[kCFBundleVersionKey as String] as? String) == originalBuildVersion else {
                     throw managedApplicationError(NSLocalizedString("Installation completed, but the updated app could not be verified on the device. Reconnect and reload the app list before retrying.", comment: ""))
+                }
+                let replacedIdentifiers = Set(profiles.values.map(\.bundleIdentifier))
+                let otherProfiles = Dictionary(grouping: snapshot.profiles.filter { !replacedIdentifiers.contains($0.bundleIdentifier) }, by: \.bundleIdentifier).values.compactMap {
+                    $0.max { $0.expirationDate < $1.expirationDate }
+                }
+                guard otherProfiles.allSatisfy({ previous in
+                    updatedSnapshot.profiles.contains { $0.uuid == previous.uuid && $0.expirationDate == previous.expirationDate }
+                }) else {
+                    throw managedApplicationError(NSLocalizedString("The app was updated, but another app's provisioning profile could not be verified afterwards. Reconnect and reload before refreshing any apps.", comment: ""))
                 }
                 // Cache only verified updates. Capture metadata before re-signing;
                 // a cache failure must not misreport the successful installation.
@@ -1518,7 +1527,7 @@ private extension ALTDeviceManager
         }
     }
     
-    func install(_ application: ALTApplication, to device: ALTDevice, team: ALTTeam, certificate: ALTCertificate, profiles: [String: ALTProvisioningProfile], pairingFile: Data?, completionHandler: @escaping (Result<Void, Error>) -> Void)
+    func install(_ application: ALTApplication, to device: ALTDevice, team: ALTTeam, certificate: ALTCertificate, profiles: [String: ALTProvisioningProfile], pairingFile: Data?, preservingOtherAppProfiles: Bool = false, completionHandler: @escaping (Result<Void, Error>) -> Void)
     {
         func prepare(_ bundle: Bundle, additionalInfoDictionaryValues: [String: Any] = [:]) throws
         {
@@ -1615,7 +1624,9 @@ private extension ALTDeviceManager
                     {
                         try Result(success, error).get()
                         
-                        let activeProfiles: Set<String>? = (team.type == .free && application.isAltStoreApp) ? Set(profiles.values.map(\.bundleIdentifier)) : nil
+                        // A managed update replaces an existing app. Keep every
+                        // other profile, including when the target is AltStore.
+                        let activeProfiles: Set<String>? = (!preservingOtherAppProfiles && team.type == .free && application.isAltStoreApp) ? Set(profiles.values.map(\.bundleIdentifier)) : nil
                         ALTDeviceManager.shared.installApp(at: application.fileURL, toDeviceWithUDID: device.identifier, activeProvisioningProfiles: activeProfiles) { (success, error) in
                             completionHandler(Result(success, error))
                         }
