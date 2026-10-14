@@ -50,7 +50,7 @@ jobs:
             -derivedDataPath build/macos \
             ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
             SDKROOT=macosx MACOSX_DEPLOYMENT_TARGET=13.0 \
-            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=99 \
+            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=100 \
             BUILD_VARIANTS=normal RUN_CLANG_STATIC_ANALYZER=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
@@ -62,7 +62,7 @@ jobs:
           app=build/macos/Build/Products/Release/AltServer.app
           test -d "$app"
           /usr/libexec/PlistBuddy -c 'Add :ALTAuthenticationWorkaround string android-gsa-80045' "$app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Add :ALTManagedApplicationsVersion integer 1' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :ALTManagedApplicationsVersion integer 2' "$app/Contents/Info.plist"
           lipo "$app/Contents/MacOS/AltServer" -verify_arch arm64 x86_64
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/AltServer-unsigned.zip
           ditto "$app" signing/AltServer.app
@@ -159,11 +159,13 @@ jobs:
           - AltServer-adhoc.zip: universal arm64/x86_64 macOS app, ad hoc signed for local use.
           - AltServer-unsigned.zip: the same build before local ad hoc signing.
 
-          Open the AltServer menu and choose Manage Apps. The app list reads actual device provisioning profile expiration dates. Select apps to renew their profiles, or drag in an original IPA to update a matching installed app. Authentication takes place on the Mac using the error -80045 workaround.
+          Open the AltServer menu and choose Manage Apps. The app list reads actual device provisioning profile expiration dates and displays remaining days alongside the local expiration time. The countdown updates every minute; reopening the window or choosing Reload reads the device again. Select apps to renew their profiles, or drag in an original IPA to update a matching installed app. Authentication takes place on the Mac using the error -80045 workaround.
 
           Renewal preserves other apps' profiles and checks the existing signing certificates. IPA updates require the same app identifier and signing team and reuse this Mac's valid certificate. If a certificate is missing or invalid, the app reports the required re-signing step. App and profile changes are read back from the device before reporting success.
 
-          This is a custom, experimental build from the public source, not an official AltStore release. Actual-device renewal and IPA-update verification are recorded after testing. The iPhone AltStore app and its cached expiration display use their existing code.
+          USB readback confirmed successful updates of LiveContainer 3.8.0 and Dopamine 3.0.11 on iOS 17.1.1. Both new profiles expire on October 21, 2026, approximately seven days after signing on October 14. The Mac's verified IPA cache and completed installation logs independently confirm both updates.
+
+          This is a custom, experimental build from the public source, not an official AltStore release. The iPhone AltStore app retains its own cached expiration dates after external Mac updates. Use the Mac Manage Apps view for the actual device profile expiration and remaining time; this build does not modify the iPhone's AltStore database.
           EOF
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" --notes-file release-notes.md

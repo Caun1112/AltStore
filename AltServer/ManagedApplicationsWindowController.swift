@@ -22,6 +22,7 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
     private var devices = [ALTDevice]()
     private var applications = [ManagedApplication]()
     private var deviceObservers = [NSObjectProtocol]()
+    private var countdownTimer: Timer?
     private weak var credentialAppleIDField: NSTextField?
     private weak var credentialPasswordField: NSSecureTextField?
     private weak var credentialSubmitButton: NSButton?
@@ -71,12 +72,18 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
             }
             self.deviceObservers.append(observer)
         }
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            self?.updateCountdowns()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.countdownTimer = timer
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     deinit
     {
+        self.countdownTimer?.invalidate()
         self.deviceObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -93,7 +100,7 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
         guard let contentView = self.window?.contentView else { return }
         let title = NSTextField(labelWithString: "管理已签名应用")
         title.font = .systemFont(ofSize: 22, weight: .semibold)
-        let subtitle = NSTextField(wrappingLabelWithString: "续签已安装的应用，或用新的 IPA 更新同一个应用。到期时间直接读取手机上的描述文件。")
+        let subtitle = NSTextField(wrappingLabelWithString: "本页从手机上的描述文件读取实际到期时间。通过电脑续签后，AltStore「My Apps」可能仍显示旧日期；请以本页重新读取的到期时间为准。")
         subtitle.textColor = .secondaryLabelColor
 
         self.devicePicker.target = self
@@ -118,7 +125,7 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
         self.tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         for (identifier, heading, width) in [("application", "应用 / 签名标识", CGFloat(440)),
                                              ("version", "版本", CGFloat(110)),
-                                             ("expiration", "描述文件到期时间（本地）", CGFloat(240))]
+                                             ("expiration", "实际到期时间 / 剩余时间", CGFloat(240))]
         {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
             column.title = heading
@@ -479,6 +486,30 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
 
     func selectionShouldChange(in tableView: NSTableView) -> Bool { !self.isBusy }
 
+    private func updateCountdowns()
+    {
+        guard self.window?.isVisible == true, !self.applications.isEmpty,
+              let column = self.tableView.tableColumns.firstIndex(where: { $0.identifier.rawValue == "expiration" }) else { return }
+        self.tableView.reloadData(forRowIndexes: IndexSet(integersIn: self.applications.indices),
+                                  columnIndexes: IndexSet(integer: column))
+    }
+
+    static func remainingTimeDescription(for expiration: Date?, relativeTo now: Date = Date()) -> (text: String, isExpired: Bool)
+    {
+        guard let expiration = expiration else { return ("剩余时间未知", false) }
+        let seconds = expiration.timeIntervalSince(now)
+        guard seconds > 0 else { return ("已过期", true) }
+        if seconds >= 86_400
+        {
+            return ("剩余 \(Int(ceil(seconds / 86_400))) 天", false)
+        }
+        if seconds >= 3_600
+        {
+            return ("剩余约 \(Int(ceil(seconds / 3_600))) 小时（不足 1 天）", false)
+        }
+        return ("不足 1 小时", false)
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView?
     {
         guard self.applications.indices.contains(row), let identifier = tableColumn?.identifier.rawValue else { return nil }
@@ -502,19 +533,25 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
             bundleID.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor, constant: -16).isActive = true
             return stack
         }
-        let label = NSTextField(labelWithString: "")
-        if identifier == "version" { label.stringValue = application.version }
-        else if let expiration = application.expirationDate
+        if identifier == "version" { return NSTextField(labelWithString: application.version) }
+        let remainingTime = Self.remainingTimeDescription(for: application.expirationDate)
+        let expirationLabel = NSTextField(labelWithString: application.expirationDate.map(self.dateFormatter.string(from:)) ?? "未读到描述文件")
+        let remainingLabel = NSTextField(labelWithString: remainingTime.text)
+        remainingLabel.font = .systemFont(ofSize: 11)
+        expirationLabel.textColor = remainingTime.isExpired ? .systemRed : (application.expirationDate == nil ? .secondaryLabelColor : .labelColor)
+        remainingLabel.textColor = remainingTime.isExpired ? .systemRed : .secondaryLabelColor
+        let stack = NSStackView(views: [expirationLabel, remainingLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 0, bottom: 5, right: 8)
+        for label in [expirationLabel, remainingLabel]
         {
-            label.stringValue = self.dateFormatter.string(from: expiration)
-            label.textColor = expiration <= Date() ? .systemRed : .labelColor
+            label.lineBreakMode = .byTruncatingTail
+            label.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor, constant: -8).isActive = true
         }
-        else
-        {
-            label.stringValue = "未读到描述文件"
-            label.textColor = .secondaryLabelColor
-        }
-        return label
+        stack.toolTip = "手机描述文件实际到期时间（本地时间）：\(expirationLabel.stringValue)\n\(remainingTime.text)"
+        return stack
     }
 }
 
