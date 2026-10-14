@@ -1,0 +1,206 @@
+name: Build Apple authentication workaround
+
+on:
+  push:
+    branches: [fix/apple-auth-80045]
+  workflow_dispatch:
+    inputs:
+      build_ios:
+        description: Also build an unsigned AltStore IPA
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auth-workaround-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build_macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+      - name: Use the selected macOS SDK for the corecrypto linker stub
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          sdk = Path(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip())
+          stub = sdk / 'usr/lib/system/libcorecrypto.tbd'
+          if not stub.is_file():
+              raise SystemExit(f'The selected SDK is missing {stub}')
+          project = Path('AltStore.xcodeproj/project.pbxproj')
+          original = 'path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk/usr/lib/system/libcorecrypto.tbd; sourceTree = DEVELOPER_DIR;'
+          contents = project.read_text()
+          if original not in contents:
+              raise SystemExit('The expected AltJIT corecrypto SDK reference has changed')
+          project.write_text(contents.replace(original, 'path = usr/lib/system/libcorecrypto.tbd; sourceTree = SDKROOT;'))
+          PY
+      - name: Build unsigned universal AltServer
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          xcodebuild -workspace AltStore.xcworkspace \
+            -scheme AltServer -configuration Release \
+            -sdk macosx -destination 'generic/platform=macOS' \
+            -derivedDataPath build/macos \
+            ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+            SDKROOT=macosx MACOSX_DEPLOYMENT_TARGET=13.0 \
+            MARKETING_VERSION=1.8.1 CURRENT_PROJECT_VERSION=98 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            ENABLE_HARDENED_RUNTIME=NO ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            build 2>&1 | tee logs/AltServer-build.log
+      - name: Package unsigned and ad hoc signed apps
+        run: |
+          mkdir -p dist signing
+          app=build/macos/Build/Products/Release/AltServer.app
+          test -d "$app"
+          /usr/libexec/PlistBuddy -c 'Add :ALTAuthenticationWorkaround string android-gsa-80045' "$app/Contents/Info.plist"
+          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/AltServer"
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/AltServer-unsigned.zip
+          ditto "$app" signing/AltServer.app
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tempfile
+
+          app = Path('signing/AltServer.app')
+          # Sign leaves first, then their containing bundles and the outer app.
+          binaries = []
+          for path in app.rglob('*'):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              description = subprocess.check_output(['file', '-b', str(path)], text=True)
+              if 'Mach-O' in description and 'archive' not in description:
+                  binaries.append(path)
+          bundles = [path for path in app.rglob('*') if path.is_dir() and not path.is_symlink()
+                     and path.suffix in {'.app', '.framework', '.xpc', '.appex'}]
+          for path in binaries + sorted(bundles, key=lambda path: len(path.parts), reverse=True) + [app]:
+              command = ['codesign', '--force', '--sign', '-', '--timestamp=none']
+              # Preserve sandbox/helper entitlements from already signed dependencies.
+              existing = subprocess.run(['codesign', '-d', '--entitlements', ':-', str(path)],
+                                        capture_output=True)
+              with tempfile.NamedTemporaryFile(suffix='.plist') as entitlements:
+                  if b'<plist' in existing.stdout:
+                      entitlements.write(existing.stdout)
+                      entitlements.flush()
+                      command += ['--entitlements', entitlements.name]
+                  subprocess.run(command + [str(path)], check=True)
+          subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+          PY
+          ditto -c -k --sequesterRsrc --keepParent signing/AltServer.app dist/AltServer-adhoc.zip
+          {
+            printf 'Source commit: %s\n' "$GITHUB_SHA"
+            xcodebuild -version
+            git submodule status --recursive
+          } > dist/AltServer-build-info.txt
+          (cd dist && shasum -a 256 AltServer-*.zip > AltServer-SHA256SUMS.txt)
+      - name: Upload macOS apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-workaround-macos
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-macos
+          path: logs/*
+          if-no-files-found: ignore
+
+  build_ios:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_ios
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+      - name: Build unsigned AltStore for iOS 17.0 and later
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          xcodebuild -workspace AltStore.xcworkspace \
+            -scheme AltStore -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            SDKROOT=iphoneos IPHONEOS_DEPLOYMENT_TARGET=17.0 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            build 2>&1 | tee logs/AltStore-build.log
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist packaging/Payload
+          ditto build/ios/Build/Products/Release-iphoneos/AltStore.app packaging/Payload/AltStore.app
+          (cd packaging && zip -q -r -y ../dist/AltStore-unsigned.ipa Payload)
+          (cd dist && shasum -a 256 AltStore-unsigned.ipa > AltStore-SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auth-workaround-ios
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-ios
+          path: logs/*
+          if-no-files-found: ignore
+
+  release:
+    needs: [build_macos, build_ios]
+    if: always() && needs.build_macos.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: auth-workaround-*
+          merge-multiple: true
+          path: dist
+      - name: Publish this build to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: auth-workaround-${{ github.run_id }}
+          IOS_RESULT: ${{ needs.build_ios.result }}
+        run: |
+          cat > release-notes.md <<EOF
+          AltServer with the Apple authentication workaround for error -80045.
+
+          Source commit: $GITHUB_SHA
+          Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          - AltServer-adhoc.zip: universal arm64/x86_64 macOS app, ad hoc signed for local use.
+          - AltServer-unsigned.zip: the same build before local ad hoc signing.
+          - The optional unsigned AltStore IPA targets iOS 17.0 and later. Its build result for this run is: $IOS_RESULT.
+
+          This is an experimental workaround, not an official AltStore release. It changes the GrandSlam sign-in client identity and handles an already delivered trusted-device verification code. Apple ID authentication and on-device refresh still need to be verified on the intended device.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --target "$GITHUB_SHA" --prerelease \
+              --title "AltServer authentication workaround (build $GITHUB_RUN_NUMBER)" \
+              --notes-file release-notes.md
+          fi
