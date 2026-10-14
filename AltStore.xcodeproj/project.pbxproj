@@ -2750,7 +2750,6 @@
 			);
 			name = AltServer;
 			packageProductDependencies = (
-				BF088D352501A821008082D9 /* AltSign-Dynamic */,
 				D58D5F2D26DFE68E00E55E38 /* LaunchAtLogin */,
 				CA1DE71000000000000005A1 /* IDevice */,
 				D53FB4C0305372F6000546E8 /* AltSign-Static */,
@@ -2918,7 +2917,6 @@
 			name = AltJIT;
 			packageProductDependencies = (
 				D5FB7A2D2AA2859400EF863D /* ArgumentParser */,
-				D52DD35D2AAA89A600A7F2B6 /* AltSign-Dynamic */,
 				D53FB4C330537302000546E8 /* AltSign-Static */,
 			);
 			productName = AltJIT;
