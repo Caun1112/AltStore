@@ -72,21 +72,36 @@ jobs:
           ditto "$app" signing/AltServer.app
           python3 - <<'PY'
           from pathlib import Path
+          import plistlib
           import subprocess
           import tempfile
 
           app = Path('signing/AltServer.app')
-          # Sign leaves first, then their containing bundles and the outer app.
+          # A bundle's main executable must be signed through its bundle, after
+          # embedded tools and nested bundles. Signing the app binary directly
+          # can cause codesign to validate still-unsigned siblings such as altjit.
+          bundles = [path for path in app.rglob('*') if path.is_dir() and not path.is_symlink()
+                     and path.suffix in {'.app', '.framework', '.xpc', '.appex'}] + [app]
+          main_executables = set()
+          for bundle in bundles:
+              plist_paths = [bundle / 'Contents/Info.plist', bundle / 'Info.plist',
+                             bundle / 'Resources/Info.plist',
+                             bundle / 'Versions/Current/Resources/Info.plist']
+              plist = next((path for path in plist_paths if path.is_file()), None)
+              executable = plistlib.loads(plist.read_bytes()).get('CFBundleExecutable') if plist else bundle.stem
+              if executable:
+                  for path in [bundle / 'Contents/MacOS' / executable, bundle / executable,
+                               bundle / 'Versions/Current' / executable]:
+                      if path.is_file():
+                          main_executables.add(path.resolve())
           binaries = []
           for path in app.rglob('*'):
               if not path.is_file() or path.is_symlink():
                   continue
               description = subprocess.check_output(['file', '-b', str(path)], text=True)
-              if 'Mach-O' in description and 'archive' not in description:
+              if 'Mach-O' in description and 'archive' not in description and path.resolve() not in main_executables:
                   binaries.append(path)
-          bundles = [path for path in app.rglob('*') if path.is_dir() and not path.is_symlink()
-                     and path.suffix in {'.app', '.framework', '.xpc', '.appex'}]
-          for path in binaries + sorted(bundles, key=lambda path: len(path.parts), reverse=True) + [app]:
+          for path in sorted(binaries + bundles, key=lambda path: len(path.parts), reverse=True):
               command = ['codesign', '--force', '--sign', '-', '--timestamp=none']
               # Preserve sandbox/helper entitlements from already signed dependencies.
               existing = subprocess.run(['codesign', '-d', '--entitlements', ':-', str(path)],
@@ -107,11 +122,12 @@ jobs:
           } > dist/AltServer-build-info.txt
           (cd dist && shasum -a 256 AltServer-*.zip > AltServer-SHA256SUMS.txt)
       - name: Upload macOS apps
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: auth-workaround-macos
           path: dist/*
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
