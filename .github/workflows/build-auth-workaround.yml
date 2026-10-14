@@ -67,7 +67,7 @@ jobs:
           app=build/macos/Build/Products/Release/AltServer.app
           test -d "$app"
           /usr/libexec/PlistBuddy -c 'Add :ALTAuthenticationWorkaround string android-gsa-80045' "$app/Contents/Info.plist"
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/AltServer"
+          lipo "$app/Contents/MacOS/AltServer" -verify_arch arm64 x86_64
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/AltServer-unsigned.zip
           ditto "$app" signing/AltServer.app
           python3 - <<'PY'
