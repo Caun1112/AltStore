@@ -34,6 +34,7 @@ extern NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification 
 - (void)removeAppForBundleIdentifier:(NSString *)bundleIdentifier fromDeviceWithUDID:(NSString *)udid completionHandler:(void (^)(BOOL success, NSError *_Nullable error))completionHandler;
 
 /* Provisioning Profiles */
+- (void)fetchProvisioningProfilesOnDevice:(ALTDevice *)device completionHandler:(void (^)(NSArray<ALTProvisioningProfile *> *_Nullable profiles, NSError *_Nullable error))completionHandler NS_SWIFT_NAME(fetchProvisioningProfiles(on:completionHandler:));
 - (void)installProvisioningProfiles:(NSSet<ALTProvisioningProfile *> *)provisioningProfiles toDeviceWithUDID:(NSString *)udid activeProvisioningProfiles:(nullable NSSet<NSString *> *)activeProvisioningProfiles completionHandler:(void (^)(BOOL success, NSError *_Nullable error))completionHandler;
 - (void)removeProvisioningProfilesForBundleIdentifiers:(NSSet<NSString *> *)bundleIdentifiers fromDeviceWithUDID:(NSString *)udid completionHandler:(void (^)(BOOL success, NSError *_Nullable error))completionHandler;
 
@@ -44,6 +45,7 @@ extern NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification 
                      completionHandler:(void (^)(BOOL success, NSError *_Nullable error))completionHandler;
 
 /* Apps */
+- (void)fetchInstalledApplicationDictionariesOnDevice:(ALTDevice *)device completionHandler:(void (^)(NSArray<NSDictionary<NSString *, id> *> *_Nullable applications, NSError *_Nullable error))completionHandler NS_SWIFT_NAME(fetchInstalledApplicationDictionaries(on:completionHandler:));
 - (void)fetchInstalledAppsOnDevice:(ALTDevice *)altDevice completionHandler:(void (^)(NSSet<ALTInstalledApp *> *_Nullable installedApps, NSError *_Nullable error))completionHandler;
 
 /* Connections */

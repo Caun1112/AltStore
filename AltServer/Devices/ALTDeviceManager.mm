@@ -657,6 +657,39 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
 
 #pragma mark - Provisioning Profiles -
 
+- (void)fetchProvisioningProfilesOnDevice:(ALTDevice *)altDevice completionHandler:(void (^)(NSArray<ALTProvisioningProfile *> *_Nullable, NSError *_Nullable))completionHandler
+{
+    dispatch_async(self.installationQueue, ^{
+        __block idevice_t device = NULL;
+        __block lockdownd_client_t client = NULL;
+        __block misagent_client_t mis = NULL;
+        __block lockdownd_service_descriptor_t service = NULL;
+
+        void (^finish)(NSArray<ALTProvisioningProfile *> *, NSError *) = ^(NSArray<ALTProvisioningProfile *> *profiles, NSError *error) {
+            lockdownd_service_descriptor_free(service);
+            misagent_client_free(mis);
+            lockdownd_client_free(client);
+            idevice_free(device);
+            dispatch_async(dispatch_get_main_queue(), ^{ completionHandler(profiles, error); });
+        };
+
+        if (idevice_new_with_options(&device, altDevice.identifier.UTF8String, (enum idevice_options)((int)IDEVICE_LOOKUP_NETWORK | (int)IDEVICE_LOOKUP_USBMUX)) != IDEVICE_E_SUCCESS)
+        {
+            return finish(nil, [NSError errorWithDomain:AltServerErrorDomain code:ALTServerErrorDeviceNotFound userInfo:nil]);
+        }
+        if (lockdownd_client_new_with_handshake(device, &client, "AltServer") != LOCKDOWN_E_SUCCESS ||
+            lockdownd_start_service(client, "com.apple.misagent", &service) != LOCKDOWN_E_SUCCESS || !service ||
+            misagent_client_new(device, service, &mis) != MISAGENT_E_SUCCESS)
+        {
+            return finish(nil, [NSError errorWithDomain:AltServerErrorDomain code:ALTServerErrorConnectionFailed userInfo:nil]);
+        }
+
+        NSError *error = nil;
+        NSArray<ALTProvisioningProfile *> *profiles = [self copyProvisioningProfilesWithClient:mis error:&error];
+        finish(profiles, error);
+    });
+}
+
 - (void)installProvisioningProfiles:(NSSet<ALTProvisioningProfile *> *)provisioningProfiles toDeviceWithUDID:(NSString *)udid activeProvisioningProfiles:(nullable NSSet<NSString *> *)activeProvisioningProfiles completionHandler:(void (^)(BOOL success, NSError *error))completionHandler
 {
     dispatch_async(self.installationQueue, ^{
@@ -665,8 +698,36 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
         __block afc_client_t afc = NULL;
         __block misagent_client_t mis = NULL;
         __block lockdownd_service_descriptor_t service = NULL;
+        __block NSArray<ALTProvisioningProfile *> *previousSelectedProfiles = nil;
+        __block BOOL didBeginReplacingProfiles = NO;
+        NSMutableSet<NSString *> *selectedBundleIdentifiers = [NSMutableSet set];
+        for (ALTProvisioningProfile *profile in provisioningProfiles)
+        {
+            [selectedBundleIdentifiers addObject:profile.bundleIdentifier];
+        }
         
         void (^finish)(NSError *_Nullable) = ^(NSError *error) {
+            // Managed refreshes pass no active-profile filter, so only the selected
+            // apps are touched. Restore their old profiles if replacement fails.
+            if (error && didBeginReplacingProfiles && activeProvisioningProfiles == nil)
+            {
+                NSError *restoreError = nil;
+                [self removeProvisioningProfilesForBundleIdentifiers:selectedBundleIdentifiers misagent:mis error:&restoreError];
+                for (ALTProvisioningProfile *previousProfile in previousSelectedProfiles)
+                {
+                    NSError *profileError = nil;
+                    if (![self installProvisioningProfile:previousProfile misagent:mis error:&profileError] && !restoreError)
+                    {
+                        restoreError = profileError;
+                    }
+                }
+                if (restoreError)
+                {
+                    NSMutableDictionary *userInfo = [error.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+                    userInfo[NSLocalizedRecoverySuggestionErrorKey] = NSLocalizedString(@"The selected apps' previous profiles could not all be restored. Reconnect the device and retry, or reinstall those apps with their original IPA files.", @"");
+                    error = [NSError errorWithDomain:error.domain code:error.code userInfo:userInfo];
+                }
+            }
             lockdownd_service_descriptor_free(service);
             misagent_client_free(mis);
             afc_client_free(afc);
@@ -700,6 +761,17 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
         }
         
         NSError *error = nil;
+
+        if (activeProvisioningProfiles == nil)
+        {
+            NSArray<ALTProvisioningProfile *> *allProfiles = [self copyProvisioningProfilesWithClient:mis error:&error];
+            if (!allProfiles) { return finish(error); }
+            NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(ALTProvisioningProfile *profile, NSDictionary *bindings) {
+                return [selectedBundleIdentifiers containsObject:profile.bundleIdentifier];
+            }];
+            previousSelectedProfiles = [allProfiles filteredArrayUsingPredicate:predicate];
+            didBeginReplacingProfiles = YES;
+        }
         
         if (activeProvisioningProfiles != nil)
         {
@@ -1313,17 +1385,30 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
 
 - (void)fetchInstalledAppsOnDevice:(ALTDevice *)altDevice completionHandler:(void (^)(NSSet<ALTInstalledApp *> *_Nullable installedApps, NSError *_Nullable error))completionHandler
 {
+    [self fetchInstalledApplicationDictionariesOnDevice:altDevice completionHandler:^(NSArray<NSDictionary<NSString *, id> *> *appDictionaries, NSError *error) {
+        if (!appDictionaries) { return completionHandler(nil, error); }
+        NSMutableSet *installedApps = [NSMutableSet set];
+        for (NSDictionary *appInfo in appDictionaries)
+        {
+            if (appInfo[@"ALTBundleIdentifier"] != nil)
+            {
+                ALTInstalledApp *installedApp = [[ALTInstalledApp alloc] initWithDictionary:appInfo];
+                if (installedApp) { [installedApps addObject:installedApp]; }
+            }
+        }
+        completionHandler(installedApps, nil);
+    }];
+}
+
+- (void)fetchInstalledApplicationDictionariesOnDevice:(ALTDevice *)altDevice completionHandler:(void (^)(NSArray<NSDictionary<NSString *, id> *> *_Nullable applications, NSError *_Nullable error))completionHandler
+{
     __block idevice_t device = NULL;
     __block instproxy_client_t ipc = NULL;
     __block lockdownd_client_t client = NULL;
     __block lockdownd_service_descriptor_t service = NULL;
     __block plist_t options = NULL;
         
-    void (^finish)(NSSet<ALTInstalledApp *> *, NSError *) = ^(NSSet<ALTInstalledApp *> *installedApps, NSError *error) {
-        if (error != nil) {
-            NSLog(@"Notification Connection Error: %@", error);
-        }
-        
+    void (^finish)(NSArray<NSDictionary<NSString *, id> *> *, NSError *) = ^(NSArray<NSDictionary<NSString *, id> *> *applications, NSError *error) {
         if (options) {
             instproxy_client_options_free(options);
         }
@@ -1344,7 +1429,7 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
             idevice_free(device);
         }
         
-        completionHandler(installedApps, error);
+        dispatch_async(dispatch_get_main_queue(), ^{ completionHandler(applications, error); });
     };
     
     // Don't use installationQueue since this operation can potentially take a very long time and will block other operations.
@@ -1397,22 +1482,7 @@ NSNotificationName const ALTDeviceManagerDeviceDidDisconnectNotification = @"ALT
             return finish(nil, error);
         }
         
-        NSMutableSet *installedApps = [NSMutableSet set];
-        for (NSDictionary *appInfo in appDictionaries)
-        {
-            if (appInfo[@"ALTBundleIdentifier"] != nil)
-            {
-                // Only return apps installed with AltStore.
-                
-                ALTInstalledApp *installedApp = [[ALTInstalledApp alloc] initWithDictionary:appInfo];
-                if (installedApp)
-                {
-                    [installedApps addObject:installedApp];
-                }
-            }
-        }
-        
-        finish(installedApps, nil);
+        finish(appDictionaries, nil);
     });
 }
 

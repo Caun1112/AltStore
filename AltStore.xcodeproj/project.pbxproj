@@ -57,6 +57,7 @@
 		BF44EEF3246B3A17002A52F2 /* AltBackup.ipa in Resources */ = {isa = PBXBuildFile; fileRef = BF44EEF2246B3A17002A52F2 /* AltBackup.ipa */; };
 		BF44EEFC246B4550002A52F2 /* RemoveAppOperation.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF44EEFB246B4550002A52F2 /* RemoveAppOperation.swift */; };
 		BF458690229872EA00BD7491 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF45868F229872EA00BD7491 /* AppDelegate.swift */; };
+		CA1D18220000000000000001 /* ManagedApplicationsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA1D18220000000000000002 /* ManagedApplicationsWindowController.swift */; };
 		BF458694229872EA00BD7491 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BF458693229872EA00BD7491 /* Assets.xcassets */; };
 		BF458697229872EA00BD7491 /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BF458695229872EA00BD7491 /* Main.storyboard */; };
 		BF4586C52298CDB800BD7491 /* ALTDeviceManager.mm in Sources */ = {isa = PBXBuildFile; fileRef = BF4586C42298CDB800BD7491 /* ALTDeviceManager.mm */; };
@@ -902,6 +903,7 @@
 		BF44EEFB246B4550002A52F2 /* RemoveAppOperation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoveAppOperation.swift; sourceTree = "<group>"; };
 		BF45868D229872EA00BD7491 /* AltServer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AltServer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BF45868F229872EA00BD7491 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		CA1D18220000000000000002 /* ManagedApplicationsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedApplicationsWindowController.swift; sourceTree = "<group>"; };
 		BF458693229872EA00BD7491 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BF458696229872EA00BD7491 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
 		BF458698229872EA00BD7491 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -1562,6 +1564,7 @@
 			isa = PBXGroup;
 			children = (
 				BF45868F229872EA00BD7491 /* AppDelegate.swift */,
+				CA1D18220000000000000002 /* ManagedApplicationsWindowController.swift */,
 				BF458695229872EA00BD7491 /* Main.storyboard */,
 				BFAD67A225E0854500D4C4D1 /* DeveloperDiskManager.swift */,
 				BFF0394A25F0551600BE607D /* MenuController.swift */,
@@ -3470,6 +3473,7 @@
 				BFECAC8524FD950B0077C41F /* Connection.swift in Sources */,
 				D58032EE2AB241D100878F5E /* AnisetteError.swift in Sources */,
 				BF458690229872EA00BD7491 /* AppDelegate.swift in Sources */,
+				CA1D18220000000000000001 /* ManagedApplicationsWindowController.swift in Sources */,
 				BFECAC8424FD950B0077C41F /* ALTConstants.m in Sources */,
 				BF4586C52298CDB800BD7491 /* ALTDeviceManager.mm in Sources */,
 				823E345E305A00E900EBB2DE /* LocalAnisetteDataManager.swift in Sources */,
@@ -4034,7 +4038,7 @@
 				CODE_SIGN_IDENTITY = "Mac Developer";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 97;
+				CURRENT_PROJECT_VERSION = 99;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 6XVY5G3U44;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -4067,7 +4071,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 1.8.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.rileytestut.AltServer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_ALLOW_JIT = YES;
@@ -4088,7 +4092,7 @@
 				CODE_SIGN_IDENTITY = "Mac Developer";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 97;
+				CURRENT_PROJECT_VERSION = 99;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = 6XVY5G3U44;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -4121,7 +4125,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.8;
+				MARKETING_VERSION = 1.8.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.rileytestut.AltServer;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				RUNTIME_EXCEPTION_ALLOW_JIT = YES;

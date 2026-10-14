@@ -1,14 +1,9 @@
-name: Build Apple authentication workaround
+name: Build AltServer 1.8.2
 
 on:
   push:
     branches: [fix/apple-auth-80045]
   workflow_dispatch:
-    inputs:
-      build_ios:
-        description: Also build an unsigned AltStore IPA
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -55,7 +50,7 @@ jobs:
             -derivedDataPath build/macos \
             ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
             SDKROOT=macosx MACOSX_DEPLOYMENT_TARGET=13.0 \
-            MARKETING_VERSION=1.8.1 CURRENT_PROJECT_VERSION=98 \
+            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=99 \
             BUILD_VARIANTS=normal RUN_CLANG_STATIC_ANALYZER=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
@@ -67,6 +62,7 @@ jobs:
           app=build/macos/Build/Products/Release/AltServer.app
           test -d "$app"
           /usr/libexec/PlistBuddy -c 'Add :ALTAuthenticationWorkaround string android-gsa-80045' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :ALTManagedApplicationsVersion integer 1' "$app/Contents/Info.plist"
           lipo "$app/Contents/MacOS/AltServer" -verify_arch arm64 x86_64
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/AltServer-unsigned.zip
           ditto "$app" signing/AltServer.app
@@ -125,7 +121,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: auth-workaround-macos
+          name: altserver-macos
           path: dist/*
           if-no-files-found: ignore
       - name: Upload build log
@@ -136,53 +132,8 @@ jobs:
           path: logs/*
           if-no-files-found: ignore
 
-  build_ios:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_ios
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Select Xcode 16.4
-        run: |
-          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
-          xcodebuild -version
-      - name: Build unsigned AltStore for iOS 17.0 and later
-        run: |
-          set -o pipefail
-          mkdir -p logs
-          xcodebuild -workspace AltStore.xcworkspace \
-            -scheme AltStore -configuration Release \
-            -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath build/ios \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
-            SDKROOT=iphoneos IPHONEOS_DEPLOYMENT_TARGET=17.0 \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
-            ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            build 2>&1 | tee logs/AltStore-build.log
-      - name: Package unsigned IPA
-        run: |
-          mkdir -p dist packaging/Payload
-          ditto build/ios/Build/Products/Release-iphoneos/AltStore.app packaging/Payload/AltStore.app
-          (cd packaging && zip -q -r -y ../dist/AltStore-unsigned.ipa Payload)
-          (cd dist && shasum -a 256 AltStore-unsigned.ipa > AltStore-SHA256SUMS.txt)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: auth-workaround-ios
-          path: dist/*
-          if-no-files-found: error
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-ios
-          path: logs/*
-          if-no-files-found: ignore
-
   release:
-    needs: [build_macos, build_ios]
+    needs: [build_macos]
     if: always() && needs.build_macos.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -190,27 +141,29 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: auth-workaround-*
+          pattern: altserver-*
           merge-multiple: true
           path: dist
       - name: Publish this build to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: auth-workaround-${{ github.run_id }}
-          IOS_RESULT: ${{ needs.build_ios.result }}
+          RELEASE_TAG: altserver-v1.8.2-${{ github.run_id }}
         run: |
           cat > release-notes.md <<EOF
-          AltServer with the Apple authentication workaround for error -80045.
+          Custom AltServer 1.8.2: renew installed apps and update them from an IPA on the Mac.
 
           Source commit: $GITHUB_SHA
           Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
 
           - AltServer-adhoc.zip: universal arm64/x86_64 macOS app, ad hoc signed for local use.
           - AltServer-unsigned.zip: the same build before local ad hoc signing.
-          - The optional unsigned AltStore IPA targets iOS 17.0 and later. Its build result for this run is: $IOS_RESULT.
 
-          This is an experimental workaround, not an official AltStore release. It changes the GrandSlam sign-in client identity and handles an already delivered trusted-device verification code. Apple ID authentication and on-device refresh still need to be verified on the intended device.
+          Open the AltServer menu and choose Manage Apps. The app list reads actual device provisioning profile expiration dates. Select apps to renew their profiles, or drag in an original IPA to update a matching installed app. Authentication takes place on the Mac using the error -80045 workaround.
+
+          Renewal preserves other apps' profiles and checks the existing signing certificates. IPA updates require the same app identifier and signing team and reuse this Mac's valid certificate. If a certificate is missing or invalid, the app reports the required re-signing step. App and profile changes are read back from the device before reporting success.
+
+          This is a custom, experimental build from the public source, not an official AltStore release. Actual-device renewal and IPA-update verification are recorded after testing. The iPhone AltStore app and its cached expiration display use their existing code.
           EOF
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" --notes-file release-notes.md
@@ -218,6 +171,6 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/* \
               --target "$GITHUB_SHA" --prerelease \
-              --title "AltServer authentication workaround (build $GITHUB_RUN_NUMBER)" \
+              --title "AltServer 1.8.2 — Mac app renewal and IPA updates (build $GITHUB_RUN_NUMBER)" \
               --notes-file release-notes.md
           fi

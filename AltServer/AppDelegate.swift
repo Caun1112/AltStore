@@ -51,6 +51,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var popoverController: NSPopover?
     private var popoverError: NSError?
     private var errorAlert: NSAlert?
+
+    private var managedApplicationsWindowController: ManagedApplicationsWindowController?
     
     func applicationDidFinishLaunching(_ aNotification: Notification)
     {
@@ -73,6 +75,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusItem = item
         
         self.appMenu.delegate = self
+
+        let manageApplicationsItem = NSMenuItem(title: "管理应用…", action: #selector(AppDelegate.manageApplications), keyEquivalent: "")
+        manageApplicationsItem.target = self
+        self.appMenu.insertItem(manageApplicationsItem, at: 0)
+        self.appMenu.insertItem(.separator(), at: 1)
         
         self.sideloadAppMenuItem.keyEquivalentModifierMask = .option
         self.sideloadAppMenuItem.isAlternate = true
@@ -119,6 +126,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 private extension AppDelegate
 {
+    @objc func manageApplications()
+    {
+        if self.managedApplicationsWindowController == nil
+        {
+            self.managedApplicationsWindowController = ManagedApplicationsWindowController()
+        }
+        self.managedApplicationsWindowController?.present()
+    }
+
     @objc func installAltStore(to device: ALTDevice)
     {
         self.installApplication(at: nil, to: device)

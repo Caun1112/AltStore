@@ -12,6 +12,103 @@ import ObjectiveC
 import CryptoKit
 import OSLog
 
+struct ManagedApplication
+{
+    let name: String
+    let bundleIdentifier: String
+    let version: String
+    let expirationDate: Date?
+    let teamIdentifier: String?
+}
+
+struct ManagedIPA
+{
+    let name: String
+    let bundleIdentifier: String
+    let version: String
+    let url: URL
+}
+
+struct ManagedApplicationRefreshResult
+{
+    let bundleIdentifier: String
+    let expirationDate: Date
+}
+
+private struct ManagedApplicationSnapshot
+{
+    let applications: [[String: Any]]
+    let profiles: [ALTProvisioningProfile]
+
+    func application(_ identifier: String) -> [String: Any]?
+    {
+        return applications.first { ($0[kCFBundleIdentifierKey as String] as? String) == identifier }
+    }
+
+    func profile(_ identifier: String) -> ALTProvisioningProfile?
+    {
+        return profiles.filter { $0.bundleIdentifier == identifier }.max { $0.expirationDate < $1.expirationDate }
+    }
+
+    func relatedProfiles(_ identifier: String) -> [ALTProvisioningProfile]
+    {
+        guard let mainProfile = profile(identifier) else { return [] }
+        let mainIdentifiers = Set(applications.compactMap { $0[kCFBundleIdentifierKey as String] as? String })
+        let candidates = profiles.filter {
+            $0.teamIdentifier == mainProfile.teamIdentifier &&
+            ($0.bundleIdentifier == identifier || ($0.bundleIdentifier.hasPrefix(identifier + ".") && !mainIdentifiers.contains($0.bundleIdentifier)))
+        }
+        return Dictionary(grouping: candidates, by: \.bundleIdentifier).values.compactMap {
+            $0.max { $0.expirationDate < $1.expirationDate }
+        }.sorted { $0.bundleIdentifier < $1.bundleIdentifier }
+    }
+}
+
+private let managedApplicationLock = NSLock()
+private var managedApplicationDevices = Set<String>()
+
+private func beginManagedApplicationOperation(on device: ALTDevice) -> Bool
+{
+    managedApplicationLock.lock()
+    defer { managedApplicationLock.unlock() }
+    return managedApplicationDevices.insert(device.identifier).inserted
+}
+
+private func endManagedApplicationOperation(on device: ALTDevice)
+{
+    managedApplicationLock.lock()
+    defer { managedApplicationLock.unlock() }
+    managedApplicationDevices.remove(device.identifier)
+}
+
+private func managedApplicationError(_ description: String) -> NSError
+{
+    return NSError(domain: "com.rileytestut.AltServer.ManagedApplications", code: 1,
+                   userInfo: [NSLocalizedDescriptionKey: description])
+}
+
+private func completeManagedApplication<T>(_ result: Result<T, Error>, _ completion: @escaping (Result<T, Error>) -> Void)
+{
+    DispatchQueue.main.async { completion(result) }
+}
+
+private func managedApplicationValue<T>(_ operation: (@escaping (T?, Error?) -> Void) -> Void) async throws -> T
+{
+    return try await withCheckedThrowingContinuation { continuation in
+        operation { value, error in
+            if let value { continuation.resume(returning: value) }
+            else { continuation.resume(throwing: error ?? ALTAppleAPIError.unknown()) }
+        }
+    }
+}
+
+private func managedApplicationResult<T>(_ operation: (@escaping (Result<T, Error>) -> Void) -> Void) async throws -> T
+{
+    return try await withCheckedThrowingContinuation { continuation in
+        operation { continuation.resume(with: $0) }
+    }
+}
+
 #if STAGING
 let altstoreSourceURL = URL(string: "https://f000.backblazeb2.com/file/altstore-staging/apps-staging.json")!
 #else
@@ -103,6 +200,215 @@ private extension ALTDeviceManager
 
 extension ALTDeviceManager
 {
+    func fetchManagedApplications(on device: ALTDevice, completion: @escaping (Result<[ManagedApplication], Error>) -> Void)
+    {
+        Task<Void, Never> {
+            do
+            {
+                let snapshot = try await self.managedApplicationSnapshot(on: device)
+                let applications = snapshot.applications.compactMap { dictionary -> ManagedApplication? in
+                    guard let identifier = dictionary[kCFBundleIdentifierKey as String] as? String else { return nil }
+                    let profile = snapshot.profile(identifier)
+                    guard profile != nil || dictionary[Bundle.Info.altBundleID] != nil else { return nil }
+                    return self.managedApplication(dictionary, profile: profile)
+                }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                completeManagedApplication(.success(applications), completion)
+            }
+            catch { completeManagedApplication(.failure(error), completion) }
+        }
+    }
+
+    func inspectManagedIPA(at url: URL, completion: @escaping (Result<ManagedIPA, Error>) -> Void)
+    {
+        Task<Void, Never> {
+            let hasAccess = url.startAccessingSecurityScopedResource()
+            defer { if hasAccess { url.stopAccessingSecurityScopedResource() } }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            do
+            {
+                let application = try self.unpackManagedIPA(at: url, to: directory)
+                let ipa = ManagedIPA(name: application.name, bundleIdentifier: application.bundleIdentifier,
+                                     version: application.version, url: url)
+                completeManagedApplication(.success(ipa), completion)
+            }
+            catch { completeManagedApplication(.failure(error), completion) }
+        }
+    }
+
+    func refreshManagedApplications(_ identifiers: [String], on device: ALTDevice, appleID: String, password: String,
+                                    completion: @escaping (Result<[ManagedApplicationRefreshResult], Error>) -> Void)
+    {
+        guard beginManagedApplicationOperation(on: device) else {
+            return completeManagedApplication(.failure(managedApplicationError(NSLocalizedString("An app operation is already running for this device.", comment: ""))), completion)
+        }
+        Task<Void, Never> {
+            defer { endManagedApplicationOperation(on: device) }
+            do
+            {
+                let identifiers = Array(Set(identifiers)).sorted()
+                guard !identifiers.isEmpty else { return completeManagedApplication(.success([]), completion) }
+                let snapshot = try await self.managedApplicationSnapshot(on: device)
+                var previousProfiles = [ALTProvisioningProfile]()
+                for identifier in identifiers
+                {
+                    guard snapshot.application(identifier) != nil, snapshot.profile(identifier) != nil else {
+                        throw managedApplicationError(NSLocalizedString("The selected app has no readable device provisioning profile. Use its original IPA to re-sign it.", comment: ""))
+                    }
+                    previousProfiles.append(contentsOf: snapshot.relatedProfiles(identifier))
+                }
+
+                // Sign in once for the entire selection. Select each team by the
+                // device's profile, never by the account's preferred/default team.
+                let (account, session) = try await self.managedAuthentication(appleID: appleID, password: password)
+                let teams: [ALTTeam] = try await managedApplicationValue { ALTAppleAPI.shared.fetchTeams(for: account, session: session, completionHandler: $0) }
+                let groups = Dictionary(grouping: previousProfiles, by: \.teamIdentifier)
+                var refreshedProfiles = [ALTProvisioningProfile]()
+                for teamIdentifier in groups.keys.sorted()
+                {
+                    guard let team = teams.first(where: { $0.identifier == teamIdentifier }) else {
+                        throw managedApplicationError(NSLocalizedString("This Apple account does not belong to the selected app's signing team. Sign in with the account that installed it.", comment: ""))
+                    }
+                    let registeredDevice: ALTDevice = try await managedApplicationResult { self.register(device, team: team, session: session, completionHandler: $0) }
+                    registeredDevice.osVersion = device.osVersion
+                    let appIDs: [ALTAppID] = try await managedApplicationValue { ALTAppleAPI.shared.fetchAppIDs(for: team, session: session, completionHandler: $0) }
+                    for previousProfile in groups[teamIdentifier] ?? []
+                    {
+                        guard let appID = appIDs.first(where: { $0.bundleIdentifier == previousProfile.bundleIdentifier }) else {
+                            throw managedApplicationError(NSLocalizedString("The selected app's exact App ID is missing from this team. Use its original IPA to re-sign it; refreshing will not create another App ID.", comment: ""))
+                        }
+                        let profile: ALTProvisioningProfile = try await managedApplicationResult {
+                            self.fetchProvisioningProfile(for: appID, device: registeredDevice, team: team, session: session, completionHandler: $0)
+                        }
+                        try self.validateManagedRefresh(profile, replacing: previousProfile, device: device)
+                        refreshedProfiles.append(profile)
+                    }
+                }
+
+                // nil removes only the selected apps' older profiles. The native
+                // installer restores them if any replacement fails.
+                try await self.installManagedProfiles(refreshedProfiles, on: device)
+                do
+                {
+                    let installedProfiles: [ALTProvisioningProfile] = try await managedApplicationValue { self.fetchProvisioningProfiles(on: device, completionHandler: $0) }
+                    for profile in refreshedProfiles
+                    {
+                        guard installedProfiles.contains(where: { $0.uuid == profile.uuid && $0.expirationDate == profile.expirationDate }) else {
+                            throw managedApplicationError(NSLocalizedString("The device did not report the renewed profile after installation. The previous profiles will be restored.", comment: ""))
+                        }
+                    }
+                }
+                catch
+                {
+                    do { try await self.installManagedProfiles(previousProfiles, on: device) }
+                    catch {
+                        throw managedApplicationError(NSLocalizedString("Renewal could not be verified and the previous profiles could not all be restored. Reconnect the device and re-sign the selected apps with their original IPA files.", comment: ""))
+                    }
+                    throw error
+                }
+                let results = identifiers.compactMap { identifier -> ManagedApplicationRefreshResult? in
+                    guard let date = refreshedProfiles.first(where: { $0.bundleIdentifier == identifier })?.expirationDate else { return nil }
+                    return ManagedApplicationRefreshResult(bundleIdentifier: identifier, expirationDate: date)
+                }
+                completeManagedApplication(.success(results), completion)
+            }
+            catch { completeManagedApplication(.failure(error), completion) }
+        }
+    }
+
+    func updateManagedApplication(_ identifier: String, withIPAAt url: URL, on device: ALTDevice, appleID: String, password: String,
+                                  completion: @escaping (Result<ManagedApplication, Error>) -> Void)
+    {
+        guard beginManagedApplicationOperation(on: device) else {
+            return completeManagedApplication(.failure(managedApplicationError(NSLocalizedString("An app operation is already running for this device.", comment: ""))), completion)
+        }
+        Task<Void, Never> {
+            let hasAccess = url.startAccessingSecurityScopedResource()
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer {
+                if hasAccess { url.stopAccessingSecurityScopedResource() }
+                try? FileManager.default.removeItem(at: directory)
+                endManagedApplicationOperation(on: device)
+            }
+            do
+            {
+                guard url.isFileURL, url.pathExtension.lowercased() == "ipa" else {
+                    throw managedApplicationError(NSLocalizedString("Choose a local .ipa file.", comment: ""))
+                }
+                // Pin the original input until verification completes so a changed
+                // source file cannot later replace the known-good cached IPA.
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let originalURL = directory.appendingPathComponent("Original.ipa")
+                try FileManager.default.copyItem(at: url, to: originalURL)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: originalURL.path)
+                let application = try self.unpackManagedIPA(at: originalURL, to: directory)
+                guard application.minimumiOSVersion <= device.osVersion else {
+                    throw managedApplicationError(NSLocalizedString("This IPA requires a newer iOS version than the selected device. Choose a compatible version; no sign-in or device changes were performed.", comment: ""))
+                }
+                let originalIPA = ManagedIPA(name: application.name, bundleIdentifier: application.bundleIdentifier,
+                                             version: application.version, url: originalURL)
+                let originalBuildVersion = application.buildVersion
+                let snapshot = try await self.managedApplicationSnapshot(on: device)
+                guard let installedDictionary = snapshot.application(identifier) else {
+                    throw managedApplicationError(NSLocalizedString("The selected app is no longer installed on this device.", comment: ""))
+                }
+                guard let teamIdentifier = snapshot.profile(identifier)?.teamIdentifier ?? self.managedTeamIdentifierHint(installedDictionary) else {
+                    throw managedApplicationError(NSLocalizedString("The selected app's signing team could not be determined from a device profile or its exact AltStore bundle identifiers. Reconnect and reload the app list.", comment: ""))
+                }
+                let signedIdentifier = self.managedSignedIdentifier(for: application, teamIdentifier: teamIdentifier)
+                guard signedIdentifier == identifier else {
+                    throw managedApplicationError(NSLocalizedString("This IPA would install as a different app. Choose the original, unsigned IPA matching the selected app's bundle identifier; already re-signed IPAs can contain a duplicate team suffix.", comment: ""))
+                }
+
+                let (account, session) = try await self.managedAuthentication(appleID: appleID, password: password)
+                let teams: [ALTTeam] = try await managedApplicationValue { ALTAppleAPI.shared.fetchTeams(for: account, session: session, completionHandler: $0) }
+                guard let team = teams.first(where: { $0.identifier == teamIdentifier }) else {
+                    throw managedApplicationError(NSLocalizedString("This Apple account does not belong to the selected app's signing team. Updating it with another team would create a separate app.", comment: ""))
+                }
+                let registeredDevice: ALTDevice = try await managedApplicationResult { self.register(device, team: team, session: session, completionHandler: $0) }
+                registeredDevice.osVersion = device.osVersion
+                let certificate = try await self.managedExistingCertificate(for: team, session: session)
+                try self.preserveManagedApplicationUTIs(in: application, installedDictionary: installedDictionary, signedIdentifier: identifier)
+                let profiles: [String: ALTProvisioningProfile] = try await managedApplicationResult {
+                    self.prepareAllProvisioningProfiles(for: application, device: registeredDevice, team: team, session: session, completion: $0)
+                }
+                guard let profile = profiles[application.bundleIdentifier], profile.bundleIdentifier == identifier,
+                      profile.teamIdentifier == teamIdentifier,
+                      profile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(device.identifier) == .orderedSame }),
+                      profile.expirationDate > Date(), profile.certificates.contains(where: { $0.serialNumber == certificate.serialNumber }) else {
+                    throw managedApplicationError(NSLocalizedString("The new signing profile does not match the selected app, device, team, or signing certificate. The installed app was not changed.", comment: ""))
+                }
+
+                let pairingFile: Data? = await withCheckedContinuation { continuation in
+                    self.encryptedPairingData(for: application, device: registeredDevice, certificate: certificate) { continuation.resume(returning: $0) }
+                }
+                _ = try await managedApplicationResult { (callback: @escaping (Result<Void, Error>) -> Void) in
+                    self.install(application, to: registeredDevice, team: team, certificate: certificate, profiles: profiles, pairingFile: pairingFile, completionHandler: callback)
+                }
+                let updatedSnapshot = try await self.managedApplicationSnapshot(on: device)
+                guard let updatedDictionary = updatedSnapshot.application(identifier), let updatedProfile = updatedSnapshot.profile(identifier),
+                      updatedProfile.uuid == profile.uuid, updatedProfile.teamIdentifier == team.identifier,
+                      updatedProfile.expirationDate == profile.expirationDate,
+                      (updatedDictionary["CFBundleShortVersionString"] as? String) == originalIPA.version,
+                      (updatedDictionary[kCFBundleVersionKey as String] as? String) == originalBuildVersion else {
+                    throw managedApplicationError(NSLocalizedString("Installation completed, but the updated app could not be verified on the device. Reconnect and reload the app list before retrying.", comment: ""))
+                }
+                // Cache only verified updates. Capture metadata before re-signing;
+                // a cache failure must not misreport the successful installation.
+                do { try self.cacheManagedIPA(originalIPA, signedIdentifier: identifier) }
+                catch { Logger.main.error("The app update was verified, but its original IPA could not be cached.") }
+                completeManagedApplication(.success(self.managedApplication(updatedDictionary, profile: updatedProfile)), completion)
+            }
+            catch { completeManagedApplication(.failure(error), completion) }
+        }
+    }
+
+    func cachedManagedIPAURL(for identifier: String) -> URL?
+    {
+        let url = self.managedIPADirectory(for: identifier).appendingPathComponent("Original.ipa")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
     func installApplication(at ipaFileURL: URL?, to altDevice: ALTDevice, appleID: String, password: String, completion: @escaping (Result<ALTApplication, Error>) -> Void)
     {
         let destinationDirectoryURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -261,6 +567,188 @@ extension ALTDeviceManager
 
 private extension ALTDeviceManager
 {
+    func managedApplicationSnapshot(on device: ALTDevice) async throws -> ManagedApplicationSnapshot
+    {
+        let applications: [[String: Any]] = try await managedApplicationValue { self.fetchInstalledApplicationDictionaries(on: device, completionHandler: $0) }
+        let profiles: [ALTProvisioningProfile] = try await managedApplicationValue { self.fetchProvisioningProfiles(on: device, completionHandler: $0) }
+        return ManagedApplicationSnapshot(applications: applications, profiles: profiles)
+    }
+
+    func managedApplication(_ dictionary: [String: Any], profile: ALTProvisioningProfile?) -> ManagedApplication
+    {
+        let identifier = dictionary[kCFBundleIdentifierKey as String] as? String ?? profile?.bundleIdentifier ?? ""
+        let name = dictionary["CFBundleDisplayName"] as? String ?? dictionary[kCFBundleNameKey as String] as? String ?? identifier
+        let version = dictionary["CFBundleShortVersionString"] as? String ?? dictionary[kCFBundleVersionKey as String] as? String ?? ""
+        return ManagedApplication(name: name, bundleIdentifier: identifier, version: version,
+                                  expirationDate: profile?.expirationDate, teamIdentifier: profile?.teamIdentifier ?? self.managedTeamIdentifierHint(dictionary))
+    }
+
+    func managedTeamIdentifierHint(_ dictionary: [String: Any]) -> String?
+    {
+        guard let identifier = dictionary[kCFBundleIdentifierKey as String] as? String,
+              let original = dictionary[Bundle.Info.altBundleID] as? String, !original.isEmpty else { return nil }
+        let candidate: String
+        if identifier.hasPrefix(original + ".")
+        {
+            candidate = String(identifier.dropFirst(original.count + 1))
+        }
+        else if identifier.hasPrefix("com."), identifier.hasSuffix("." + original)
+        {
+            candidate = String(identifier.dropFirst(4).dropLast(original.count + 1))
+        }
+        else { return nil }
+        // This is only a hint for recovering an expired app whose profile was
+        // removed. Account membership and the generated App ID are still checked.
+        guard candidate.utf8.count == 10, candidate.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) }) else { return nil }
+        return candidate
+    }
+
+    func managedAuthentication(appleID: String, password: String) async throws -> (ALTAccount, ALTAppleAPISession)
+    {
+        let anisetteData: ALTAnisetteData = try await managedApplicationResult { AnisetteDataManager.shared.requestAnisetteData($0) }
+        return try await managedApplicationResult { self.authenticate(appleID: appleID, password: password, anisetteData: anisetteData, completionHandler: $0) }
+    }
+
+    func installManagedProfiles(_ profiles: [ALTProvisioningProfile], on device: ALTDevice) async throws
+    {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            self.installProvisioningProfiles(Set(profiles), toDeviceWithUDID: device.identifier, activeProvisioningProfiles: nil) { success, error in
+                if success { continuation.resume() }
+                else { continuation.resume(throwing: error ?? ALTAppleAPIError.unknown()) }
+            }
+        }
+    }
+
+    func validateManagedRefresh(_ profile: ALTProvisioningProfile, replacing previous: ALTProvisioningProfile, device: ALTDevice) throws
+    {
+        guard profile.bundleIdentifier == previous.bundleIdentifier, profile.teamIdentifier == previous.teamIdentifier,
+              profile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(device.identifier) == .orderedSame }) else {
+            throw managedApplicationError(NSLocalizedString("Apple returned a profile for a different app, team, or device. No device profiles were changed.", comment: ""))
+        }
+        guard profile.expirationDate > Date(), profile.expirationDate > previous.expirationDate else {
+            throw managedApplicationError(NSLocalizedString("Apple did not extend this app's expiration date. No device profiles were changed; try again later.", comment: ""))
+        }
+        let previousCertificates = Set(previous.certificates.compactMap(\.data))
+        let newCertificates = Set(profile.certificates.compactMap(\.data))
+        guard !previousCertificates.isEmpty, previousCertificates.count == previous.certificates.count,
+              previousCertificates.isSubset(of: newCertificates) else {
+            throw managedApplicationError(NSLocalizedString("The app's existing signing certificate is missing from the renewed profile. Profile-only renewal cannot re-sign an app; update it with its original IPA instead.", comment: ""))
+        }
+        for key: ALTEntitlement in [.applicationIdentifier, .teamIdentifier, .appGroups, .keychainAccessGroups, .getTaskAllow]
+        {
+            guard let oldValue = previous.entitlements[key] else { continue }
+            guard let newValue = profile.entitlements[key] else {
+                throw managedApplicationError(NSLocalizedString("The renewed profile no longer permits this app's existing entitlements. Update it with its original IPA instead.", comment: ""))
+            }
+            if let oldStrings = oldValue as? [String], let newStrings = newValue as? [String]
+            {
+                guard Set(oldStrings).isSubset(of: Set(newStrings)) else {
+                    throw managedApplicationError(NSLocalizedString("The app's existing app-group or keychain access is incompatible with the renewed profile. Update it with its original IPA instead.", comment: ""))
+                }
+            }
+            else if !NSDictionary(dictionary: ["value": oldValue]).isEqual(to: ["value": newValue])
+            {
+                throw managedApplicationError(NSLocalizedString("The app's signing entitlements changed. Update it with its original IPA instead of performing profile-only renewal.", comment: ""))
+            }
+        }
+    }
+
+    func unpackManagedIPA(at url: URL, to directory: URL) throws -> ALTApplication
+    {
+        guard url.isFileURL, url.pathExtension.lowercased() == "ipa" else {
+            throw managedApplicationError(NSLocalizedString("Choose a local .ipa file.", comment: ""))
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let bundleURL = try FileManager.default.unzipAppBundle(at: url, toDirectory: directory)
+        guard let application = ALTApplication(fileURL: bundleURL) else { throw ALTError(.invalidApp) }
+        return application
+    }
+
+    func managedSignedIdentifier(for application: ALTApplication, teamIdentifier: String) -> String
+    {
+        return application.isAltStoreApp ? "com.\(teamIdentifier).\(application.bundleIdentifier)" : application.bundleIdentifier + "." + teamIdentifier
+    }
+
+    func managedExistingCertificate(for team: ALTTeam, session: ALTAppleAPISession) async throws -> ALTCertificate
+    {
+        let certificates: [ALTCertificate] = try await managedApplicationValue { ALTAppleAPI.shared.fetchCertificates(for: team, session: session, completionHandler: $0) }
+        let url = FileManager.default.certificatesDirectory.appendingPathComponent(team.identifier + ".p12")
+        guard let data = try? Data(contentsOf: url) else {
+            throw managedApplicationError(NSLocalizedString("This Mac has no cached signing certificate for the app's team. Install AltStore with this AltServer first, then retry the IPA update.", comment: ""))
+        }
+        for liveCertificate in certificates
+        {
+            if let certificate = ALTCertificate(p12Data: data, password: liveCertificate.machineIdentifier),
+               certificate.serialNumber == liveCertificate.serialNumber, certificate.privateKey != nil
+            {
+                certificate.machineIdentifier = liveCertificate.machineIdentifier
+                return certificate
+            }
+        }
+        throw managedApplicationError(NSLocalizedString("This Mac's cached certificate is no longer valid for this team. Re-establish signing with the Install AltStore menu before retrying; no certificates were revoked by this operation.", comment: ""))
+    }
+
+    func preserveManagedApplicationUTIs(in application: ALTApplication, installedDictionary: [String: Any], signedIdentifier: String) throws
+    {
+        func update(_ bundleURL: URL, signedBundleIdentifier: String, previousDeclarations: [[String: Any]]) throws
+        {
+            guard let bundle = Bundle(url: bundleURL), var dictionary = bundle.completeInfoDictionary else { throw ALTError(.missingInfoPlist) }
+            var declarations = dictionary[Bundle.Info.exportedUTIs] as? [[String: Any]] ?? []
+            let knownIdentifiers = Set(declarations.compactMap { $0["UTTypeIdentifier"] as? String })
+            declarations.append(contentsOf: previousDeclarations.filter {
+                guard let identifier = $0["UTTypeIdentifier"] as? String else { return false }
+                return !knownIdentifiers.contains(identifier)
+            })
+            let trackingIdentifier = "io.altstore.Installed." + signedBundleIdentifier
+            if !declarations.contains(where: { ($0["UTTypeIdentifier"] as? String) == trackingIdentifier })
+            {
+                declarations.append(["UTTypeIdentifier": trackingIdentifier, "UTTypeDescription": "AltStore Installed App",
+                                     "UTTypeConformsTo": [String](), "UTTypeTagSpecification": [String: String]()])
+            }
+            dictionary[Bundle.Info.exportedUTIs] = declarations
+            try (dictionary as NSDictionary).write(to: bundle.infoPlistURL)
+        }
+        let previous = installedDictionary[Bundle.Info.exportedUTIs] as? [[String: Any]] ?? []
+        try update(application.fileURL, signedBundleIdentifier: signedIdentifier, previousDeclarations: previous)
+        for appExtension in application.appExtensions
+        {
+            let identifier = appExtension.bundleIdentifier.replacingOccurrences(of: application.bundleIdentifier, with: signedIdentifier)
+            try update(appExtension.fileURL, signedBundleIdentifier: identifier, previousDeclarations: [])
+        }
+    }
+
+    func managedIPADirectory(for identifier: String) -> URL
+    {
+        let key = SHA256.hash(data: Data(identifier.utf8)).map { String(format: "%02x", $0) }.joined()
+        return FileManager.default.altserverDirectory.appendingPathComponent("AppLibrary", isDirectory: true).appendingPathComponent(key, isDirectory: true)
+    }
+
+    func cacheManagedIPA(_ ipa: ManagedIPA, signedIdentifier: String) throws
+    {
+        let directory = self.managedIPADirectory(for: signedIdentifier)
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.deletingLastPathComponent().path)
+        let temporaryURL = directory.appendingPathComponent(UUID().uuidString + ".ipa")
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+        try fileManager.copyItem(at: ipa.url, to: temporaryURL)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporaryURL.path)
+        let destinationURL = directory.appendingPathComponent("Original.ipa")
+        if fileManager.fileExists(atPath: destinationURL.path)
+        {
+            _ = try fileManager.replaceItemAt(destinationURL, withItemAt: temporaryURL)
+        }
+        else { try fileManager.moveItem(at: temporaryURL, to: destinationURL) }
+        let metadata: [String: Any] = ["name": ipa.name, "version": ipa.version,
+                                       "originalBundleIdentifier": ipa.bundleIdentifier,
+                                       "installedBundleIdentifier": signedIdentifier, "cachedAt": Date()]
+        let metadataURL = directory.appendingPathComponent("Metadata.plist")
+        let data = try PropertyListSerialization.data(fromPropertyList: metadata, format: .binary, options: 0)
+        try data.write(to: metadataURL, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
+    }
+
     func prepare(_ device: ALTDevice, completionHandler: @escaping (Result<Void, Error>) -> Void)
     {        
         Task<Void, Never> {
