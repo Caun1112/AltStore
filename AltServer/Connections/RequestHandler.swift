@@ -89,6 +89,37 @@ struct ServerRequestHandler: RequestHandler
         }
     }
     
+    func handleFetchInstalledAppProfilesRequest(_ request: FetchInstalledAppProfilesRequest, for connection: Connection,
+                                                completionHandler: @escaping (Result<FetchInstalledAppProfilesResponse, Error>) -> Void)
+    {
+        guard request.version == 1, (1...32).contains(request.bundleIdentifiers.count),
+              request.bundleIdentifiers.allSatisfy({ identifier in
+                  (1...255).contains(identifier.utf8.count) &&
+                  identifier.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 46 } &&
+                  !identifier.split(separator: ".", omittingEmptySubsequences: false).contains(where: { $0.isEmpty })
+              }) else {
+            return completionHandler(.failure(ALTServerError(.invalidRequest)))
+        }
+
+        // A wireless request does not identify the sending device. Profiles are
+        // returned only to a USB connection belonging to the requested device.
+        guard let wiredConnection = connection as? WiredConnection else {
+            let error = NSError(domain: "com.rileytestut.AltServer.InstalledAppProfiles", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: NSLocalizedString("Connect this iPhone to AltServer with a USB cable to sync installed app expiration dates.", comment: "")])
+            return completionHandler(.failure(error))
+        }
+        guard wiredConnection.device.identifier.caseInsensitiveCompare(request.udid) == .orderedSame else {
+            return completionHandler(.failure(ALTServerError(.invalidRequest)))
+        }
+        guard let device = ALTDeviceManager.shared.availableDevices.first(where: { $0.identifier.caseInsensitiveCompare(request.udid) == .orderedSame }) else {
+            return completionHandler(.failure(ALTServerError(.deviceNotFound)))
+        }
+
+        ALTDeviceManager.shared.fetchInstalledAppProfiles(request.bundleIdentifiers, on: device) { result in
+            completionHandler(result.map { FetchInstalledAppProfilesResponse(udid: device.identifier, applications: $0) })
+        }
+    }
+
     func handleInstallProvisioningProfilesRequest(_ request: InstallProvisioningProfilesRequest, for connection: Connection,
                                                   completionHandler: @escaping (Result<InstallProvisioningProfilesResponse, Error>) -> Void)
     {

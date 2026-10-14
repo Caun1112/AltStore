@@ -1,4 +1,4 @@
-name: Build AltServer 1.8.2
+name: Build AltServer and AltStore profile sync
 
 on:
   push:
@@ -50,7 +50,7 @@ jobs:
             -derivedDataPath build/macos \
             ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
             SDKROOT=macosx MACOSX_DEPLOYMENT_TARGET=13.0 \
-            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=100 \
+            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=101 \
             BUILD_VARIANTS=normal RUN_CLANG_STATIC_ANALYZER=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
@@ -62,7 +62,8 @@ jobs:
           app=build/macos/Build/Products/Release/AltServer.app
           test -d "$app"
           /usr/libexec/PlistBuddy -c 'Add :ALTAuthenticationWorkaround string android-gsa-80045' "$app/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Add :ALTManagedApplicationsVersion integer 2' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :ALTManagedApplicationsVersion integer 3' "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :ALTManagedProfileSyncVersion integer 1' "$app/Contents/Info.plist"
           lipo "$app/Contents/MacOS/AltServer" -verify_arch arm64 x86_64
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/AltServer-unsigned.zip
           ditto "$app" signing/AltServer.app
@@ -132,40 +133,265 @@ jobs:
           path: logs/*
           if-no-files-found: ignore
 
+  build_ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Select an installed Xcode 26 SDK
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          candidates = []
+          for application in Path('/Applications').glob('Xcode_26*.app'):
+              match = re.fullmatch(r'Xcode_(26(?:\.\d+)*)\.app', application.name)
+              developer = application / 'Contents/Developer'
+              if match and developer.is_dir():
+                  version = tuple(int(part) for part in match.group(1).split('.'))
+                  candidates.append((version, developer))
+          if not candidates:
+              raise SystemExit('This runner has no installed Xcode 26.x. An iOS 26 SDK is required by the current Classic source.')
+          developer = max(candidates, key=lambda item: item[0])[1]
+          print(f'Selected {developer}', flush=True)
+          subprocess.run(['sudo', 'xcode-select', '--switch', str(developer)], check=True)
+          subprocess.run(['xcodebuild', '-version'], check=True)
+          sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], text=True).strip()
+          if int(sdk.split('.')[0]) < 26:
+              raise SystemExit(f'The selected iOS SDK is too old: {sdk}')
+          print(f'iOS SDK: {sdk}')
+          PY
+      - name: Build unsigned AltStore 2.3 for iOS 17.0 and later
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          xcodebuild -workspace AltStore.xcworkspace \
+            -scheme AltStore -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            SDKROOT=iphoneos IPHONEOS_DEPLOYMENT_TARGET=17.0 \
+            MARKETING_VERSION=2.3 CURRENT_PROJECT_VERSION=65 \
+            BUILD_VARIANTS=normal RUN_CLANG_STATIC_ANALYZER=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            build 2>&1 | tee logs/AltStore-build.log
+      - name: Validate and package unsigned and ad hoc iOS apps
+        run: |
+          mkdir -p dist packaging/Payload
+          app=build/ios/Build/Products/Release-iphoneos/AltStore.app
+          test -d "$app"
+          /usr/libexec/PlistBuddy -c 'Add :ALTManagedProfileSyncVersion integer 1' "$app/Info.plist"
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import plistlib
+          import subprocess
+
+          app = Path('build/ios/Build/Products/Release-iphoneos/AltStore.app')
+          widget = app / 'PlugIns/AltWidgetExtension.appex'
+          if not widget.is_dir():
+              raise SystemExit('AltStore is missing the AltWidget extension')
+          app_info = plistlib.loads((app / 'Info.plist').read_bytes())
+          if app_info.get('CFBundleIdentifier') != 'com.rileytestut.AltStore':
+              raise SystemExit('The original AltStore bundle identifier was changed')
+          if app_info.get('CFBundleShortVersionString') != '2.3' or app_info.get('CFBundleVersion') != '65':
+              raise SystemExit('AltStore has an unexpected version or build number')
+          if app_info.get('ALTManagedProfileSyncVersion') != 1:
+              raise SystemExit('The profile synchronization marker is missing')
+
+          manifest = {'bundles': [], 'architectures': {}, 'requested_entitlements': {}}
+          for bundle in [app, widget]:
+              info = plistlib.loads((bundle / 'Info.plist').read_bytes())
+              minimum = info.get('MinimumOSVersion')
+              if minimum != '17.0':
+                  raise SystemExit(f'{bundle.name} has an unexpected minimum iOS version: {minimum}')
+              if (bundle / 'embedded.mobileprovision').exists() or (bundle / '_CodeSignature').exists():
+                  raise SystemExit(f'{bundle.name} contains a provisioning profile or a bundle signature')
+              if bundle == widget and not info.get('CFBundleIdentifier', '').startswith(app_info['CFBundleIdentifier'] + '.'):
+                  raise SystemExit('The Widget bundle identifier does not belong to AltStore')
+              manifest['bundles'].append({'path': bundle.relative_to(app.parent).as_posix(),
+                                          'identifier': info['CFBundleIdentifier'], 'minimum_iOS': minimum})
+
+          for path in app.rglob('*'):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              description = subprocess.check_output(['file', '-b', str(path)], text=True)
+              if 'Mach-O' not in description or 'archive' in description:
+                  continue
+              architectures = subprocess.check_output(['lipo', '-archs', str(path)], text=True).strip().split()
+              if 'arm64' not in architectures or any(architecture in {'i386', 'x86_64'} for architecture in architectures):
+                  raise SystemExit(f'{path} is not an arm64 device binary: {architectures}')
+              manifest['architectures'][path.relative_to(app).as_posix()] = architectures
+          for bundle in [app, widget]:
+              executable = plistlib.loads((bundle / 'Info.plist').read_bytes())['CFBundleExecutable']
+              if (bundle / executable).relative_to(app).as_posix() not in manifest['architectures']:
+                  raise SystemExit(f'{bundle.name} is missing its device executable')
+
+          # An unsigned IPA has no signed entitlements. Keep the requested app
+          # and Widget entitlements in the manifest for the later re-signing step.
+          for name, source in [('AltStore', 'AltStore/AltStore.entitlements'),
+                               ('AltWidgetExtension', 'AltWidget/AltWidgetExtension.entitlements')]:
+              entitlements = plistlib.loads(Path(source).read_bytes())
+              if entitlements.get('com.apple.security.application-groups') != ['group.com.rileytestut.AltStore']:
+                  raise SystemExit(f'{name} has unexpected shared app group entitlements')
+              manifest['requested_entitlements'][name] = entitlements
+          if app_info.get('ALTAppGroups') != ['group.com.rileytestut.AltStore']:
+              raise SystemExit('AltStore is missing its shared app group metadata')
+          Path('dist/AltStore-validation.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+          ditto "$app" packaging/Payload/AltStore.app
+          (cd packaging && zip -q -r -y ../dist/AltStore-unsigned.ipa Payload)
+          python3 - <<'PY'
+          from pathlib import PurePosixPath
+          import plistlib
+          import zipfile
+          with zipfile.ZipFile('dist/AltStore-unsigned.ipa') as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('The IPA has a corrupt ZIP entry')
+              for name in archive.namelist():
+                  path = PurePosixPath(name)
+                  if path.is_absolute() or '..' in path.parts or path.parts[0] != 'Payload':
+                      raise SystemExit(f'Unexpected IPA archive path: {name}')
+              info = plistlib.loads(archive.read('Payload/AltStore.app/Info.plist'))
+              widget = plistlib.loads(archive.read('Payload/AltStore.app/PlugIns/AltWidgetExtension.appex/Info.plist'))
+              if info['MinimumOSVersion'] != '17.0' or widget['MinimumOSVersion'] != '17.0':
+                  raise SystemExit('The packaged app or Widget requires a newer iOS version')
+              if info.get('ALTManagedProfileSyncVersion') != 1:
+                  raise SystemExit('The packaged profile synchronization marker is missing')
+          PY
+          mkdir -p signing/ios/Payload
+          ditto "$app" signing/ios/Payload/AltStore.app
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import plistlib
+          import subprocess
+
+          app = Path('signing/ios/Payload/AltStore.app')
+          widget = app / 'PlugIns/AltWidgetExtension.appex'
+          entitlements_sources = {
+              app: Path('AltStore/AltStore.entitlements'),
+              widget: Path('AltWidget/AltWidgetExtension.entitlements')
+          }
+          bundles = [path for path in app.rglob('*') if path.is_dir() and not path.is_symlink()
+                     and path.suffix in {'.app', '.framework', '.xpc', '.appex'}] + [app]
+          main_executables = set()
+          for bundle in bundles:
+              plist_paths = [bundle / 'Info.plist', bundle / 'Contents/Info.plist',
+                             bundle / 'Resources/Info.plist', bundle / 'Versions/Current/Resources/Info.plist']
+              plist = next((path for path in plist_paths if path.is_file()), None)
+              executable = plistlib.loads(plist.read_bytes()).get('CFBundleExecutable') if plist else bundle.stem
+              if executable:
+                  for path in [bundle / executable, bundle / 'Contents/MacOS' / executable,
+                               bundle / 'Versions/Current' / executable]:
+                      if path.is_file():
+                          main_executables.add(path.resolve())
+          binaries = []
+          for path in app.rglob('*'):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              description = subprocess.check_output(['file', '-b', str(path)], text=True)
+              if 'Mach-O' in description and 'archive' not in description and path.resolve() not in main_executables:
+                  binaries.append(path)
+          for path in sorted(binaries + bundles, key=lambda path: len(path.parts), reverse=True):
+              command = ['codesign', '--force', '--sign', '-', '--timestamp=none', '--generate-entitlement-der']
+              if path in entitlements_sources:
+                  command += ['--entitlements', str(entitlements_sources[path])]
+              subprocess.run(command + [str(path)], check=True)
+          subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+          manifest_path = Path('dist/AltStore-validation.json')
+          manifest = json.loads(manifest_path.read_text())
+          manifest['ad_hoc_entitlements'] = {}
+          for bundle, source in entitlements_sources.items():
+              signed = subprocess.check_output(['codesign', '-d', '--entitlements', ':-', str(bundle)])
+              actual = plistlib.loads(signed)
+              expected = plistlib.loads(source.read_bytes())
+              if actual != expected or actual.get('com.apple.security.application-groups') != ['group.com.rileytestut.AltStore']:
+                  raise SystemExit(f'{bundle.name} did not retain its source entitlements')
+              details = subprocess.run(['codesign', '-d', '--verbose=2', str(bundle)], capture_output=True, text=True, check=True)
+              if 'Signature=adhoc' not in details.stdout + details.stderr:
+                  raise SystemExit(f'{bundle.name} is not ad hoc signed')
+              manifest['ad_hoc_entitlements'][bundle.relative_to(app.parent).as_posix()] = actual
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+          (cd signing/ios && zip -q -r -y ../../dist/AltStore-adhoc.ipa Payload)
+          python3 - <<'PY'
+          import plistlib
+          import zipfile
+          with zipfile.ZipFile('dist/AltStore-adhoc.ipa') as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('The ad hoc IPA has a corrupt ZIP entry')
+              for prefix in ['Payload/AltStore.app', 'Payload/AltStore.app/PlugIns/AltWidgetExtension.appex']:
+                  info = plistlib.loads(archive.read(prefix + '/Info.plist'))
+                  if info['MinimumOSVersion'] != '17.0':
+                      raise SystemExit('The ad hoc IPA requires a newer iOS version')
+                  if prefix + '/_CodeSignature/CodeResources' not in archive.namelist():
+                      raise SystemExit(f'{prefix} is missing its ad hoc bundle signature')
+              info = plistlib.loads(archive.read('Payload/AltStore.app/Info.plist'))
+              if info.get('ALTManagedProfileSyncVersion') != 1:
+                  raise SystemExit('The ad hoc IPA is missing the profile synchronization marker')
+          PY
+          {
+            printf 'Source commit: %s\n' "$GITHUB_SHA"
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            git submodule status --recursive
+          } > dist/AltStore-build-info.txt
+          (cd dist && shasum -a 256 AltStore-unsigned.ipa AltStore-adhoc.ipa > AltStore-SHA256SUMS.txt)
+      - name: Upload iOS apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: altstore-ios
+          path: dist/*
+          if-no-files-found: error
+      - name: Upload iOS build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-ios
+          path: logs/*
+          if-no-files-found: ignore
+
   release:
-    needs: [build_macos]
-    if: always() && needs.build_macos.result == 'success'
+    needs: [build_macos, build_ios]
+    if: always() && needs.build_macos.result == 'success' && needs.build_ios.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: altserver-*
+          pattern: alt*-*
           merge-multiple: true
           path: dist
       - name: Publish this build to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: altserver-v1.8.2-${{ github.run_id }}
+          RELEASE_TAG: profile-sync-${{ github.run_id }}
         run: |
           cat > release-notes.md <<EOF
-          Custom AltServer 1.8.2: renew installed apps and update them from an IPA on the Mac.
+          Paired custom AltServer 1.8.2 (build 101) and AltStore Classic 2.3 (build 65) with device provisioning profile synchronization.
 
           Source commit: $GITHUB_SHA
           Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
 
           - AltServer-adhoc.zip: universal arm64/x86_64 macOS app, ad hoc signed for local use.
           - AltServer-unsigned.zip: the same build before local ad hoc signing.
+          - AltStore-unsigned.ipa: unsigned arm64 iPhone app with its AltWidget extension, built with an iOS 26 SDK and a minimum deployment target of iOS 17.0.
+          - AltStore-adhoc.ipa: the same iPhone build ad hoc signed without an Apple certificate. The original app and Widget entitlements, including their shared app group, are preserved and verified. Use this package with the Mac Manage Apps updater so it can read those entitlements before re-signing.
+          - Build manifests record the source revision, toolchains, bundle compatibility, architectures, and requested app group entitlements. SHA256SUMS files verify the downloadable app archives.
 
-          Open the AltServer menu and choose Manage Apps. The app list reads actual device provisioning profile expiration dates and displays remaining days alongside the local expiration time. The countdown updates every minute; reopening the window or choosing Reload reads the device again. Select apps to renew their profiles, or drag in an original IPA to update a matching installed app. Authentication takes place on the Mac using the error -80045 workaround.
+          Open the AltServer menu and choose Manage Apps to renew installed apps or update a matching app from an original IPA. The Mac reads actual device profile expiration dates and displays remaining time. The paired iPhone app requests those actual profile dates from AltServer and updates its My Apps records after external Mac renewal. Authentication continues to use the error -80045 workaround on the Mac.
 
-          Renewal preserves other apps' profiles and checks the existing signing certificates. IPA updates require the same app identifier and signing team and reuse this Mac's valid certificate. If a certificate is missing or invalid, the app reports the required re-signing step. App and profile changes are read back from the device before reporting success.
+          The iPhone build uses the current Classic database schema so it can upgrade an existing 2.2.2 installation without downgrading the schema. Its original bundle identifier is preserved. Re-signing for the same Apple ID, installed app identifier, and shared app group remains necessary before installation; neither IPA is signed with an Apple development certificate in this workflow.
 
-          USB readback confirmed successful updates of LiveContainer 3.8.0 and Dopamine 3.0.11 on iOS 17.1.1. Both new profiles expire on October 21, 2026, approximately seven days after signing on October 14. The Mac's verified IPA cache and completed installation logs independently confirm both updates.
-
-          This is a custom, experimental build from the public source, not an official AltStore release. The iPhone AltStore app retains its own cached expiration dates after external Mac updates. Use the Mac Manage Apps view for the actual device profile expiration and remaining time; this build does not modify the iPhone's AltStore database.
+          This is a custom experimental build from public source, not an official AltStore release. The paired build must still be installed and checked on the intended iOS 17.1.1 device; build success and archive checks alone do not confirm on-device behavior.
           EOF
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" --notes-file release-notes.md
@@ -173,6 +399,6 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/* \
               --target "$GITHUB_SHA" --prerelease \
-              --title "AltServer 1.8.2 — Mac app renewal and IPA updates (build $GITHUB_RUN_NUMBER)" \
+              --title "AltServer 1.8.2 + AltStore 2.3 — profile synchronization (build $GITHUB_RUN_NUMBER)" \
               --notes-file release-notes.md
           fi

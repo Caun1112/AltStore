@@ -22,6 +22,7 @@ public enum ServerRequest: Decodable
     case anisetteData(AnisetteDataRequest)
     case prepareApp(PrepareAppRequest)
     case beginInstallation(BeginInstallationRequest)
+    case fetchInstalledAppProfiles(FetchInstalledAppProfilesRequest)
     case installProvisioningProfiles(InstallProvisioningProfilesRequest)
     case removeProvisioningProfiles(RemoveProvisioningProfilesRequest)
     case removeApp(RemoveAppRequest)
@@ -35,6 +36,7 @@ public enum ServerRequest: Decodable
         case .anisetteData(let request): return request.identifier
         case .prepareApp(let request): return request.identifier
         case .beginInstallation(let request): return request.identifier
+        case .fetchInstalledAppProfiles(let request): return request.identifier
         case .installProvisioningProfiles(let request): return request.identifier
         case .removeProvisioningProfiles(let request): return request.identifier
         case .removeApp(let request): return request.identifier
@@ -50,6 +52,7 @@ public enum ServerRequest: Decodable
         case .anisetteData(let request): return request.version
         case .prepareApp(let request): return request.version
         case .beginInstallation(let request): return request.version
+        case .fetchInstalledAppProfiles(let request): return request.version
         case .installProvisioningProfiles(let request): return request.version
         case .removeProvisioningProfiles(let request): return request.version
         case .removeApp(let request): return request.version
@@ -86,6 +89,10 @@ public enum ServerRequest: Decodable
             let request = try BeginInstallationRequest(from: decoder)
             self = .beginInstallation(request)
           
+        case "FetchInstalledAppProfilesRequest":
+            let request = try FetchInstalledAppProfilesRequest(from: decoder)
+            self = .fetchInstalledAppProfiles(request)
+
         case "InstallProvisioningProfilesRequest":
             let request = try InstallProvisioningProfilesRequest(from: decoder)
             self = .installProvisioningProfiles(request)
@@ -116,6 +123,7 @@ public enum ServerResponse: Decodable
 {
     case anisetteData(AnisetteDataResponse)
     case installationProgress(InstallationProgressResponse)
+    case fetchInstalledAppProfiles(FetchInstalledAppProfilesResponse)
     case installProvisioningProfiles(InstallProvisioningProfilesResponse)
     case removeProvisioningProfiles(RemoveProvisioningProfilesResponse)
     case removeApp(RemoveAppResponse)
@@ -129,6 +137,7 @@ public enum ServerResponse: Decodable
         {
         case .anisetteData(let response): return response.identifier
         case .installationProgress(let response): return response.identifier
+        case .fetchInstalledAppProfiles(let response): return response.identifier
         case .installProvisioningProfiles(let response): return response.identifier
         case .removeProvisioningProfiles(let response): return response.identifier
         case .removeApp(let response): return response.identifier
@@ -144,6 +153,7 @@ public enum ServerResponse: Decodable
         {
         case .anisetteData(let response): return response.version
         case .installationProgress(let response): return response.version
+        case .fetchInstalledAppProfiles(let response): return response.version
         case .installProvisioningProfiles(let response): return response.version
         case .removeProvisioningProfiles(let response): return response.version
         case .removeApp(let response): return response.version
@@ -177,6 +187,10 @@ public enum ServerResponse: Decodable
             let response = try InstallationProgressResponse(from: decoder)
             self = .installationProgress(response)
            
+        case "FetchInstalledAppProfilesResponse":
+            let response = try FetchInstalledAppProfilesResponse(from: decoder)
+            self = .fetchInstalledAppProfiles(response)
+
         case "InstallProvisioningProfilesResponse":
             let response = try InstallProvisioningProfilesResponse(from: decoder)
             self = .installProvisioningProfiles(response)
@@ -504,5 +518,53 @@ public struct PairingFileResponse: ServerMessageProtocol
     public init(pairingFile: Data)
     {
         self.pairingFile = pairingFile
+    }
+}
+
+// Read-only synchronization of profiles already installed on the connected device.
+// Unlike renewal, this request does not authenticate with Apple or modify a profile.
+public struct FetchInstalledAppProfilesRequest: ServerMessageProtocol
+{
+    public var version = 1
+    public var identifier = "FetchInstalledAppProfilesRequest"
+    public var udid: String
+    public var bundleIdentifiers: Set<String>
+
+    public init(udid: String, bundleIdentifiers: Set<String>)
+    {
+        self.udid = udid
+        self.bundleIdentifiers = bundleIdentifiers
+    }
+}
+
+public struct InstalledAppProfile: Codable
+{
+    public var bundleIdentifier: String
+    public var version: String
+    public var buildVersion: String
+    // Preserve Apple's signed profile, allowing the client to verify its app,
+    // team and device fields instead of trusting a fabricated expiration date.
+    public var provisioningProfile: Data
+
+    public init(bundleIdentifier: String, version: String, buildVersion: String, provisioningProfile: Data)
+    {
+        self.bundleIdentifier = bundleIdentifier
+        self.version = version
+        self.buildVersion = buildVersion
+        self.provisioningProfile = provisioningProfile
+    }
+}
+
+public struct FetchInstalledAppProfilesResponse: ServerMessageProtocol
+{
+    public var version = 1
+    public var identifier = "FetchInstalledAppProfilesResponse"
+    public var udid: String
+    public var applications: [InstalledAppProfile]
+
+    public init(udid: String, applications: [InstalledAppProfile])
+    {
+        self.udid = udid
+        self.applications = applications
     }
 }

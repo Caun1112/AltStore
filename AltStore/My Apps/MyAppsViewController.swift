@@ -55,6 +55,11 @@ class MyAppsViewController: UICollectionViewController, PeekPopPreviewing
     private var dropDestinationIndexPath: IndexPath?
     private var isCheckingForUpdates = false
     private var didChangeActiveApps = false
+    private var isProfileSyncVisible = false
+    private var isSyncingProfilesFromMac = false
+    private var profileSyncTimer: Timer?
+    private lazy var profileSyncButton = UIBarButtonItem(title: NSLocalizedString("同步电脑", comment: "Sync installed app dates from AltServer over USB"),
+                                                       style: .plain, target: self, action: #selector(MyAppsViewController.syncProfilesFromMac(_:)))
     
     private var _imagePickerInstalledApp: InstalledApp?
     private var _viewDidAppear = false
@@ -68,11 +73,21 @@ class MyAppsViewController: UICollectionViewController, PeekPopPreviewing
         
         NotificationCenter.default.addObserver(self, selector: #selector(MyAppsViewController.didFetchSource(_:)), name: AppManager.didFetchSourceNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(MyAppsViewController.importApp(_:)), name: AppDelegate.importAppDeepLinkNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(MyAppsViewController.didBecomeActiveForProfileSync(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
+    }
+
+    deinit
+    {
+        self.profileSyncTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
     }
     
     override func viewDidLoad()
     {
         super.viewDidLoad()
+
+        let existingButtons = self.navigationItem.rightBarButtonItems ?? self.navigationItem.rightBarButtonItem.map { [$0] } ?? []
+        self.navigationItem.rightBarButtonItems = existingButtons + [self.profileSyncButton]
         
         // Allows us to intercept delegate callbacks.
         self.updatesDataSource.fetchedResultsController.delegate = self
@@ -125,7 +140,8 @@ class MyAppsViewController: UICollectionViewController, PeekPopPreviewing
         
         self.update()
         
-        self.fetchAppIDs()
+        // Opening My Apps for USB metadata synchronization must not trigger
+        // Apple authentication. App-ID management remains available in its tab.
     }
     
     override func viewDidAppear(_ animated: Bool)
@@ -133,6 +149,24 @@ class MyAppsViewController: UICollectionViewController, PeekPopPreviewing
         super.viewDidAppear(animated)
         
         _viewDidAppear = true
+        self.isProfileSyncVisible = true
+        self.profileSyncTimer?.invalidate()
+        self.profileSyncTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self = self, self.isProfileSyncVisible, self.viewIfLoaded?.window != nil,
+                  UIApplication.shared.applicationState == .active else { return }
+            self.updateVisibleProfileCountdowns()
+            self.synchronizeProfilesFromMac(manual: false)
+        }
+        self.updateVisibleProfileCountdowns()
+        self.synchronizeProfilesFromMac(manual: false)
+    }
+
+    override func viewWillDisappear(_ animated: Bool)
+    {
+        super.viewWillDisappear(animated)
+        self.isProfileSyncVisible = false
+        self.profileSyncTimer?.invalidate()
+        self.profileSyncTimer = nil
     }
     
     override func prepare(for segue: UIStoryboardSegue, sender: Any?)
@@ -170,6 +204,66 @@ class MyAppsViewController: UICollectionViewController, PeekPopPreviewing
 
 private extension MyAppsViewController
 {
+    @objc func syncProfilesFromMac(_ sender: UIBarButtonItem)
+    {
+        self.synchronizeProfilesFromMac(manual: true)
+    }
+
+    @objc func didBecomeActiveForProfileSync(_ notification: Notification)
+    {
+        guard self.isProfileSyncVisible, self.viewIfLoaded?.window != nil else { return }
+        self.updateVisibleProfileCountdowns()
+        self.synchronizeProfilesFromMac(manual: false)
+    }
+
+    func synchronizeProfilesFromMac(manual: Bool)
+    {
+        guard !self.isSyncingProfilesFromMac else { return }
+        if !manual
+        {
+            guard self.isProfileSyncVisible, self.viewIfLoaded?.window != nil,
+                  UIApplication.shared.applicationState == .active else { return }
+        }
+        self.isSyncingProfilesFromMac = true
+        self.profileSyncButton.isEnabled = false
+        self.profileSyncButton.isIndicatingActivity = manual
+        AppManager.shared.synchronizeInstalledAppProfilesFromMac { [weak self] result in
+            guard let self = self else { return }
+            self.isSyncingProfilesFromMac = false
+            self.profileSyncButton.isIndicatingActivity = false
+            self.profileSyncButton.isEnabled = true
+            self.updateVisibleProfileCountdowns()
+            guard manual, self.isProfileSyncVisible, self.viewIfLoaded?.window != nil else { return }
+            let toast: ToastView
+            switch result
+            {
+            case .success(let count):
+                let text = count > 0 ? String(format: NSLocalizedString("已从电脑同步 %@ 个应用", comment: ""), NSNumber(value: count)) : NSLocalizedString("没有需要同步的应用", comment: "")
+                let detail = count > 0 ? NSLocalizedString("版本和到期时间已保存，断开电脑后仍会正确倒数。", comment: "") : NSLocalizedString("现有的到期时间保持不变。", comment: "")
+                toast = ToastView(text: text, detailText: detail)
+            case .failure(let error): toast = ToastView(error: error)
+            }
+            toast.preferredDuration = 4
+            toast.show(in: self)
+        }
+    }
+
+    func updateVisibleProfileCountdowns()
+    {
+        // Update just visible banners, avoiding reloadData during Core Data's
+        // collection-view batch updates. Calendar-day counts continue offline.
+        guard self.isViewLoaded else { return }
+        for indexPath in self.collectionView.indexPathsForVisibleItems where indexPath.section == Section.activeApps.rawValue
+        {
+            guard let cell = self.collectionView.cellForItem(at: indexPath) as? InstalledAppCollectionViewCell else { continue }
+            let app = self.dataSource.item(at: indexPath)
+            guard !app.isRefreshing, !AppManager.shared.isActivelyManagingApp(withBundleID: app.bundleIdentifier) else { continue }
+            let days = app.expirationDate.numberOfCalendarDays(since: Date())
+            let text = days == 1 ? NSLocalizedString("1 day", comment: "") : String(format: NSLocalizedString("%@ days", comment: ""), NSNumber(value: days))
+            cell.bannerView.configure(for: app, action: .custom(text.uppercased()))
+        }
+    }
+
     func makeDataSource() -> RSTCompositeCollectionViewPrefetchingDataSource<InstalledApp, UIImage>
     {
         let dataSource = RSTCompositeCollectionViewPrefetchingDataSource<InstalledApp, UIImage>(dataSources: [self.noUpdatesDataSource, self.updatesDataSource, self.activeAppsDataSource, self.inactiveAppsDataSource])

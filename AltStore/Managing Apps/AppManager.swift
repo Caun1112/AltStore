@@ -20,6 +20,115 @@ import AltStoreCore
 import AltSign
 import Roxas
 
+private func installedProfileSyncError(_ description: String) -> NSError
+{
+    return NSError(domain: "io.altstore.InstalledProfileSync", code: 1, userInfo: [NSLocalizedDescriptionKey: description])
+}
+
+private final class InstalledProfileSyncState
+{
+    private let lock = NSLock()
+    private var finished = false
+    private var committing = false
+    private var connection: ServerConnection?
+    private var timeout: DispatchWorkItem?
+    private let completion: (Result<Int, Error>) -> Void
+
+    init(completion: @escaping (Result<Int, Error>) -> Void) { self.completion = completion }
+
+    func startTimeout()
+    {
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finish(.failure(installedProfileSyncError(NSLocalizedString("Connect this iPhone by USB, unlock it, and run the updated AltServer on your Mac, then try syncing again.", comment: ""))))
+        }
+        lock.lock()
+        if finished { lock.unlock(); return }
+        timeout = workItem
+        lock.unlock()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: workItem)
+    }
+
+    func attach(_ connection: ServerConnection) -> Bool
+    {
+        lock.lock()
+        if finished
+        {
+            lock.unlock()
+            connection.connection.disconnect()
+            return false
+        }
+        guard self.connection == nil, !committing else { lock.unlock(); return false }
+        self.connection = connection
+        lock.unlock()
+        return true
+    }
+
+    func beginCommit() -> Bool
+    {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished, !committing else { return false }
+        committing = true
+        timeout?.cancel()
+        return true
+    }
+
+    func finish(_ result: Result<Int, Error>, fromCommit: Bool = false)
+    {
+        lock.lock()
+        guard !finished, !committing || fromCommit else { lock.unlock(); return }
+        finished = true
+        timeout?.cancel()
+        let connection = self.connection
+        self.connection = nil
+        lock.unlock()
+        connection?.connection.disconnect()
+        completion(result)
+    }
+}
+
+// These are field checks on a profile received over the device-bound USB
+// connection. ALTProvisioningProfile parsing does not verify its CMS signature.
+private func validateInstalledProfileSync(_ response: FetchInstalledAppProfilesResponse, requested: Set<String>,
+                                          udid: String, teamIdentifier: String, now: Date = Date()) throws -> [(InstalledAppProfile, ALTProvisioningProfile)]
+{
+    guard response.version == 1, response.udid.caseInsensitiveCompare(udid) == .orderedSame,
+          (1...32).contains(requested.count), response.applications.count == requested.count,
+          Set(response.applications.map(\.bundleIdentifier)) == requested else {
+        throw installedProfileSyncError(NSLocalizedString("AltServer returned an incomplete or mismatched device response. Existing app dates were kept.", comment: ""))
+    }
+    return try response.applications.map { record in
+        guard !record.provisioningProfile.isEmpty, record.provisioningProfile.count <= 1_048_576,
+              (1...128).contains(record.version.utf8.count), (1...128).contains(record.buildVersion.utf8.count),
+              (record.version + record.buildVersion).unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
+              let profile = ALTProvisioningProfile(data: record.provisioningProfile),
+              profile.bundleIdentifier == record.bundleIdentifier, profile.teamIdentifier == teamIdentifier,
+              profile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }) else {
+            throw installedProfileSyncError(NSLocalizedString("An installed profile did not match the requested app, signing team, or this iPhone. Existing app dates were kept.", comment: ""))
+        }
+        let creation = profile.creationDate.timeIntervalSince1970
+        let expiration = profile.expirationDate.timeIntervalSince1970
+        guard creation.isFinite, expiration.isFinite, creation >= 978_307_200,
+              profile.creationDate <= now.addingTimeInterval(86_400), expiration > creation,
+              expiration - creation <= 400 * 86_400 else {
+            throw installedProfileSyncError(NSLocalizedString("An installed profile contained inconsistent dates. Existing app dates were kept.", comment: ""))
+        }
+        return (record, profile)
+    }
+}
+
+private func shouldApplyInstalledProfileSync(_ profile: ALTProvisioningProfile, localRefreshedDate: Date, localExpirationDate: Date) throws -> Bool
+{
+    // A response can arrive after another operation has updated Core Data.
+    // Keep that operation's newer dates and version instead of replaying stale data.
+    guard profile.creationDate >= localRefreshedDate else { return false }
+    if profile.creationDate == localRefreshedDate && profile.expirationDate != localExpirationDate
+    {
+        throw installedProfileSyncError(NSLocalizedString("The profile's expiration date changed without a newer creation date. Existing app dates were kept; reconnect and sync again.", comment: ""))
+    }
+    return true
+}
+
 extension AppManager
 {
     static let didFetchSourceNotification = Notification.Name("io.altstore.AppManager.didFetchSource")
@@ -58,6 +167,8 @@ class AppManager: ObservableObject
     }()
     
     private weak var requestUDIDAction: UIAlertAction?
+    private let installedProfileSyncLock = NSLock()
+    private var installedProfileSyncInFlight = false
     
     private init()
     {
@@ -159,6 +270,121 @@ extension AppManager
 
 extension AppManager
 {
+    // Synchronize device metadata only. This never starts Apple authentication,
+    // obtains anisette data, signs an app, or installs a provisioning profile.
+    func synchronizeInstalledAppProfilesFromMac(completion: @escaping (Result<Int, Error>) -> Void)
+    {
+        installedProfileSyncLock.lock()
+        guard !installedProfileSyncInFlight else {
+            installedProfileSyncLock.unlock()
+            DispatchQueue.main.async {
+                completion(.failure(installedProfileSyncError(NSLocalizedString("A sync from your Mac is already in progress.", comment: ""))))
+            }
+            return
+        }
+        installedProfileSyncInFlight = true
+        installedProfileSyncLock.unlock()
+
+        let state = InstalledProfileSyncState { result in
+            self.installedProfileSyncLock.lock()
+            self.installedProfileSyncInFlight = false
+            self.installedProfileSyncLock.unlock()
+            DispatchQueue.main.async { completion(result) }
+        }
+        state.startTimeout()
+        guard let udid = Bundle.main.object(forInfoDictionaryKey: Bundle.Info.deviceID) as? String ?? UserDefaults.shared.deviceID,
+              !udid.isEmpty, let ownApplication = ALTApplication(fileURL: Bundle.main.bundleURL),
+              let ownProfile = ownApplication.provisioningProfile,
+              ownProfile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(udid) == .orderedSame }) else {
+            state.finish(.failure(installedProfileSyncError(NSLocalizedString("This AltStore installation does not identify this iPhone in its signing profile. Reinstall AltStore from your Mac before syncing dates.", comment: ""))))
+            return
+        }
+        let teamIdentifier = ownProfile.teamIdentifier
+        DatabaseManager.shared.persistentContainer.performBackgroundTask { context in
+            let applications = InstalledApp.fetchActiveApps(in: context).filter {
+                !self.isActivelyManagingApp(withBundleID: $0.bundleIdentifier) &&
+                ($0.team == nil || $0.team?.identifier == teamIdentifier)
+            }
+            let requested = Set(applications.map(\.resignedBundleIdentifier))
+            guard requested.count == applications.count, requested.count <= 32 else {
+                state.finish(.failure(installedProfileSyncError(NSLocalizedString("The active app list cannot be synchronized in a single request. Existing app dates were kept.", comment: ""))))
+                return
+            }
+            guard !requested.isEmpty else { state.finish(.success(0)); return }
+            DispatchQueue.main.async {
+                // Connect directly to the wired server. Discovery can otherwise
+                // prefer AltDaemon or Wi-Fi, neither of which binds the device.
+                ServerManager.shared.startDiscovering()
+                ServerManager.shared.connect(to: Server(connectionType: .wired)) { result in
+                    switch result
+                    {
+                    case .failure:
+                        state.finish(.failure(installedProfileSyncError(NSLocalizedString("Connect this iPhone by USB, unlock it, and run the updated AltServer on your Mac, then try syncing again.", comment: ""))))
+                    case .success(let connection):
+                        guard state.attach(connection) else { return }
+                        let request = FetchInstalledAppProfilesRequest(udid: udid, bundleIdentifiers: requested)
+                        connection.send(request) { result in
+                            switch result
+                            {
+                            case .failure(let error): state.finish(.failure(error))
+                            case .success:
+                                connection.receiveResponse { result in
+                                    do
+                                    {
+                                        let response = try result.get()
+                                        let installedResponse: FetchInstalledAppProfilesResponse
+                                        switch response
+                                        {
+                                        case .fetchInstalledAppProfiles(let value): installedResponse = value
+                                        case .error(let value):
+                                            switch value.error
+                                            {
+                                            case ALTServerError.unknownRequest:
+                                                throw installedProfileSyncError(NSLocalizedString("This AltServer does not support installed-profile synchronization. Update AltServer on your Mac and connect this iPhone by USB.", comment: ""))
+                                            default: throw value.error
+                                            }
+                                        default:
+                                            throw installedProfileSyncError(NSLocalizedString("This AltServer does not support installed-profile synchronization. Update AltServer on your Mac and connect this iPhone by USB.", comment: ""))
+                                        }
+                                        let profiles = try validateInstalledProfileSync(installedResponse, requested: requested, udid: udid, teamIdentifier: teamIdentifier)
+                                        guard state.beginCommit() else { return }
+                                        DatabaseManager.shared.persistentContainer.performBackgroundTask { saveContext in
+                                            do
+                                            {
+                                                var count = 0
+                                                for (record, profile) in profiles
+                                                {
+                                                    let predicate = NSPredicate(format: "%K == %@", #keyPath(InstalledApp.resignedBundleIdentifier), record.bundleIdentifier)
+                                                    guard let app = InstalledApp.first(satisfying: predicate, in: saveContext), app.isActive,
+                                                          app.resignedBundleIdentifier == record.bundleIdentifier,
+                                                          app.team == nil || app.team?.identifier == profile.teamIdentifier,
+                                                          !self.isActivelyManagingApp(withBundleID: app.bundleIdentifier) else { continue }
+                                                    guard try shouldApplyInstalledProfileSync(profile, localRefreshedDate: app.refreshedDate, localExpirationDate: app.expirationDate) else { continue }
+                                                    app.update(provisioningProfile: profile)
+                                                    app.version = record.version
+                                                    app.buildVersion = record.buildVersion
+                                                    count += 1
+                                                }
+                                                try saveContext.save()
+                                                DispatchQueue.main.async { WidgetCenter.shared.reloadAllTimelines() }
+                                                state.finish(.success(count), fromCommit: true)
+                                            }
+                                            catch {
+                                                saveContext.rollback()
+                                                state.finish(.failure(error), fromCommit: true)
+                                            }
+                                        }
+                                    }
+                                    catch { state.finish(.failure(error)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func update()
     {
         DatabaseManager.shared.persistentContainer.performBackgroundTask { (context) in
@@ -1169,6 +1395,8 @@ extension AppManager
     
     func isActivelyManagingApp(withBundleID bundleID: String) -> Bool
     {
+        os_unfair_lock_lock(self.progressLock)
+        defer { os_unfair_lock_unlock(self.progressLock) }
         let isActivelyManaging = self.installationProgress.keys.contains(bundleID) || self.refreshProgress.keys.contains(bundleID)
         return isActivelyManaging
     }

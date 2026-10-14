@@ -15,6 +15,9 @@ public protocol RequestHandler
     func handleAnisetteDataRequest(_ request: AnisetteDataRequest, for connection: Connection, completionHandler: @escaping (Result<AnisetteDataResponse, Error>) -> Void)
     func handlePrepareAppRequest(_ request: PrepareAppRequest, for connection: Connection, completionHandler: @escaping (Result<InstallationProgressResponse, Error>) -> Void)
     
+    func handleFetchInstalledAppProfilesRequest(_ request: FetchInstalledAppProfilesRequest, for connection: Connection,
+                                                completionHandler: @escaping (Result<FetchInstalledAppProfilesResponse, Error>) -> Void)
+
     func handleInstallProvisioningProfilesRequest(_ request: InstallProvisioningProfilesRequest, for connection: Connection,
                                                   completionHandler: @escaping (Result<InstallProvisioningProfilesResponse, Error>) -> Void)
     func handleRemoveProvisioningProfilesRequest(_ request: RemoveProvisioningProfilesRequest, for connection: Connection,
@@ -149,6 +152,11 @@ private extension ConnectionManager
                 
             case .success(.beginInstallation): break
                 
+            case .success(.fetchInstalledAppProfiles(let request)):
+                self.requestHandler.handleFetchInstalledAppProfilesRequest(request, for: connection) { result in
+                    finish(result)
+                }
+
             case .success(.installProvisioningProfiles(let request)):
                 self.requestHandler.handleInstallProvisioningProfilesRequest(request, for: connection) { (result) in
                     finish(result)

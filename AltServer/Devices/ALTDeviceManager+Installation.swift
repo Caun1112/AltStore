@@ -200,6 +200,34 @@ private extension ALTDeviceManager
 
 extension ALTDeviceManager
 {
+    func fetchInstalledAppProfiles(_ bundleIdentifiers: Set<String>, on device: ALTDevice,
+                                   completion: @escaping (Result<[InstalledAppProfile], Error>) -> Void)
+    {
+        Task<Void, Never> {
+            do
+            {
+                let snapshot = try await self.managedApplicationSnapshot(on: device)
+                let applications = try bundleIdentifiers.sorted().map { identifier -> InstalledAppProfile in
+                    guard let application = snapshot.application(identifier) else {
+                        throw managedApplicationError(NSLocalizedString("A requested app is no longer installed on this iPhone. Reload the app list and try again.", comment: ""))
+                    }
+                    guard let profile = snapshot.profile(identifier), !profile.data.isEmpty,
+                          profile.deviceIDs.contains(where: { $0.caseInsensitiveCompare(device.identifier) == .orderedSame }) else {
+                        throw managedApplicationError(NSLocalizedString("A requested app has no readable provisioning profile for this iPhone. Its expiration date could not be synced.", comment: ""))
+                    }
+                    guard let buildVersion = application[kCFBundleVersionKey as String] as? String, !buildVersion.isEmpty,
+                          let version = (application["CFBundleShortVersionString"] as? String) ?? (application[kCFBundleVersionKey as String] as? String), !version.isEmpty else {
+                        throw managedApplicationError(NSLocalizedString("The iPhone did not report a requested app's installed version. Its expiration date could not be synced.", comment: ""))
+                    }
+                    return InstalledAppProfile(bundleIdentifier: identifier, version: version, buildVersion: buildVersion,
+                                               provisioningProfile: profile.data)
+                }
+                completeManagedApplication(.success(applications), completion)
+            }
+            catch { completeManagedApplication(.failure(error), completion) }
+        }
+    }
+
     func fetchManagedApplications(on device: ALTDevice, completion: @escaping (Result<[ManagedApplication], Error>) -> Void)
     {
         Task<Void, Never> {
@@ -360,6 +388,36 @@ extension ALTDeviceManager
                     throw managedApplicationError(NSLocalizedString("This IPA would install as a different app. Choose the original, unsigned IPA matching the selected app's bundle identifier; already re-signed IPAs can contain a duplicate team suffix.", comment: ""))
                 }
 
+                let syncAltStore = application.isAltStoreApp && (application.bundle.object(forInfoDictionaryKey: "ALTManagedProfileSyncVersion") as? Int) == 1
+                if syncAltStore
+                {
+                    // Ad hoc signatures preserve the build's requested entitlements.
+                    // A completely unsigned binary loses them when AltSign reads it.
+                    // Reject that input before changing the existing App ID's groups.
+                    for component in [application] + Array(application.appExtensions)
+                    {
+                        guard let groups = component.entitlements[.appGroups] as? [String],
+                              groups.contains("group.com.rileytestut.AltStore") else {
+                            throw managedApplicationError(NSLocalizedString("Use AltStore-adhoc.ipa from this release to preserve AltStore's shared database and widget access. The fully unsigned IPA has no embedded entitlement signature and cannot be used for this update.", comment: ""))
+                        }
+                    }
+                    guard let previous = snapshot.profile(identifier),
+                          let groups = previous.entitlements[.appGroups] as? [String],
+                          groups.contains("group.com.rileytestut.AltStore." + teamIdentifier) else {
+                        throw managedApplicationError(NSLocalizedString("The installed AltStore's shared database group could not be verified. Reload the connected device before updating AltStore.", comment: ""))
+                    }
+                    for previous in snapshot.relatedProfiles(identifier)
+                    {
+                        let components = [application] + Array(application.appExtensions)
+                        guard let component = components.first(where: {
+                            self.managedSignedIdentifier(for: $0, teamIdentifier: teamIdentifier) == previous.bundleIdentifier
+                        }), let requestedGroups = component.entitlements[.appGroups] as? [String],
+                              Set(previous.entitlements[.appGroups] as? [String] ?? []).isSubset(of: Set(requestedGroups.map { $0 + "." + teamIdentifier })) else {
+                            throw managedApplicationError(NSLocalizedString("This AltStore package would remove an existing shared database group. No Apple App ID or installed app was changed.", comment: ""))
+                        }
+                    }
+                }
+
                 let (account, session) = try await self.managedAuthentication(appleID: appleID, password: password)
                 let teams: [ALTTeam] = try await managedApplicationValue { ALTAppleAPI.shared.fetchTeams(for: account, session: session, completionHandler: $0) }
                 guard let team = teams.first(where: { $0.identifier == teamIdentifier }) else {
@@ -371,6 +429,17 @@ extension ALTDeviceManager
                 try self.preserveManagedApplicationUTIs(in: application, installedDictionary: installedDictionary, signedIdentifier: identifier)
                 let profiles: [String: ALTProvisioningProfile] = try await managedApplicationResult {
                     self.prepareAllProvisioningProfiles(for: application, device: registeredDevice, team: team, session: session, completion: $0)
+                }
+                if syncAltStore
+                {
+                    for previous in snapshot.relatedProfiles(identifier)
+                    {
+                        let oldGroups = Set(previous.entitlements[.appGroups] as? [String] ?? [])
+                        guard let replacement = profiles.values.first(where: { $0.bundleIdentifier == previous.bundleIdentifier }),
+                              oldGroups.isSubset(of: Set(replacement.entitlements[.appGroups] as? [String] ?? [])) else {
+                            throw managedApplicationError(NSLocalizedString("The new AltStore profiles would change an existing shared database group. The installed app was not replaced.", comment: ""))
+                        }
+                    }
                 }
                 guard let profile = profiles[application.bundleIdentifier], profile.bundleIdentifier == identifier,
                       profile.teamIdentifier == teamIdentifier,
