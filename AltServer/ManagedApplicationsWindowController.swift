@@ -494,14 +494,17 @@ final class ManagedApplicationsWindowController: NSWindowController, NSTableView
                                   columnIndexes: IndexSet(integer: column))
     }
 
-    static func remainingTimeDescription(for expiration: Date?, relativeTo now: Date = Date()) -> (text: String, isExpired: Bool)
+    static func remainingTimeDescription(for expiration: Date?, relativeTo now: Date = Date(), calendar: Calendar = .current) -> (text: String, isExpired: Bool)
     {
         guard let expiration = expiration else { return ("剩余时间未知", false) }
         let seconds = expiration.timeIntervalSince(now)
         guard seconds > 0 else { return ("已过期", true) }
-        if seconds >= 86_400
+        // Match My Apps: remaining days count local calendar boundaries rather
+        // than rounding elapsed 24-hour intervals up to another day.
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: expiration)).day ?? 0
+        if days > 0
         {
-            return ("剩余 \(Int(ceil(seconds / 86_400))) 天", false)
+            return ("剩余 \(days) 天", false)
         }
         if seconds >= 3_600
         {

@@ -50,7 +50,7 @@ jobs:
             -derivedDataPath build/macos \
             ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
             SDKROOT=macosx MACOSX_DEPLOYMENT_TARGET=13.0 \
-            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=101 \
+            MARKETING_VERSION=1.8.2 CURRENT_PROJECT_VERSION=102 \
             BUILD_VARIANTS=normal RUN_CLANG_STATIC_ANALYZER=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY='' DEVELOPMENT_TEAM='' \
@@ -376,7 +376,7 @@ jobs:
           RELEASE_TAG: profile-sync-${{ github.run_id }}
         run: |
           cat > release-notes.md <<EOF
-          Paired custom AltServer 1.8.2 (build 101) and AltStore Classic 2.3 (build 65) with device provisioning profile synchronization.
+          Paired custom AltServer 1.8.2 (build 102) and AltStore Classic 2.3 (build 65) with device provisioning profile synchronization.
 
           Source commit: $GITHUB_SHA
           Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
@@ -387,7 +387,7 @@ jobs:
           - AltStore-adhoc.ipa: the same iPhone build ad hoc signed without an Apple certificate. The original app and Widget entitlements, including their shared app group, are preserved and verified. Use this package with the Mac Manage Apps updater so it can read those entitlements before re-signing.
           - Build manifests record the source revision, toolchains, bundle compatibility, architectures, and requested app group entitlements. SHA256SUMS files verify the downloadable app archives.
 
-          Open the AltServer menu and choose Manage Apps to renew installed apps or update a matching app from an original IPA. The Mac reads actual device profile expiration dates and displays remaining time. The paired iPhone app requests those actual profile dates from AltServer and updates its My Apps records after external Mac renewal. Authentication continues to use the error -80045 workaround on the Mac.
+          Open the AltServer menu and choose Manage Apps to renew installed apps or update a matching app from an original IPA. The Mac reads actual device profile expiration dates and displays remaining time using the same local calendar-day count as iPhone My Apps. The paired iPhone app requests those actual profile dates from AltServer and updates its My Apps records after external Mac renewal. Authentication continues to use the error -80045 workaround on the Mac.
 
           The iPhone build uses the current Classic database schema so it can upgrade an existing 2.2.2 installation without downgrading the schema. Its original bundle identifier is preserved. Re-signing for the same Apple ID, installed app identifier, and shared app group remains necessary before installation; neither IPA is signed with an Apple development certificate in this workflow.
 
